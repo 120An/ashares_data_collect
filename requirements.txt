@@ -9,3 +9,10 @@ tqdm
 tenacity
 phart
 pytest
+opensearch-py
+sentence-transformers
+opencc-python-reimplemented
+akshare
+curl_cffi
+trafilatura
+pymupdf

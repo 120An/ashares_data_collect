@@ -79,3 +79,32 @@ def download_history_with_retry(
                 f"下载异常 (第{attempt}/{max_retries}次, "
                 f"{len(stock_list)}只{period}): {exc}, {action}..."
             )
+
+
+def get_etf_codes(sectors: List[str] | None = None, exclude_money: bool = False) -> List[str]:
+    """获取场内 ETF 代码列表（带市场后缀，如 510300.SH）。
+
+    依赖本地板块缓存（同 get_a_share_codes）：需先 download_sector_data()——由 pipeline 的
+    a_share_sector 任务或首次手动执行；**不在此内联下载**（download_sector_data 无超时、曾挂死）。
+    sectors: ETF 板块名列表（默认沪深/沪市/深市ETF，实测板块名）。
+    号段兜底过滤（is_etf_code）防止非 ETF 混入。exclude_money: 剔除货币 ETF（511xxx / 159001 等）。
+    """
+    from data_collect.utils.etf_utils import to_bare_code, with_suffix, is_etf_code
+
+    xtdata = require_xtdata()
+    if sectors is None:
+        sectors = ["沪深ETF", "沪市ETF", "深市ETF"]
+
+    merged = set()
+    for sec in sectors:
+        try:
+            merged.update(xtdata.get_stock_list_in_sector(sec) or [])
+        except Exception as exc:
+            logger.warning(f"读取ETF板块 {sec} 失败: {exc}")
+
+    bare = {to_bare_code(c) for c in merged}
+    bare = {b for b in bare if is_etf_code(b)}     # 号段兜底
+    if exclude_money:
+        bare = {b for b in bare if b[:3] not in ("511",) and b not in ("159001", "159003", "159005")}
+
+    return sorted(with_suffix(b) for b in bare)

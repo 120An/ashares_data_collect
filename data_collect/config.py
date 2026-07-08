@@ -61,6 +61,14 @@ def get_qmt_config() -> Dict[str, Any]:
     return dict(_load_config().get("qmt", {}))
 
 
+def get_opensearch_config() -> Dict[str, Any]:
+    return dict(_load_config().get("opensearch", {}))
+
+
+def get_news_config() -> Dict[str, Any]:
+    return dict(_load_config().get("news", {}))
+
+
 def reload_config() -> None:
     """强制重新加载配置（测试时使用）。"""
     global _config_cache

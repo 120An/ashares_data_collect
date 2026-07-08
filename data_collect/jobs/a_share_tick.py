@@ -31,7 +31,7 @@ import pyarrow.parquet as pq
 from tqdm import tqdm
 
 from data_collect.config import get_tick_config
-from data_collect.utils.date_utils import is_market_day, date_range, minus_one_market_day
+from data_collect.utils.date_utils import is_market_day, date_range
 from data_collect.utils.df_utils import normalize_trade_date
 from data_collect.utils.notify import send_dingtalk
 from data_collect.utils.retry import retry_xtquant
@@ -268,12 +268,15 @@ def _collect_one_day(
         os.replace(str(tmp), str(final))    # 原子落盘，避免半成品文件
         return DayResult(len(codes), with_data, rows, "written")
 
-    # 全天无数据：清理 tmp，写 .empty 标记，避免后续 verify 反复重试（多为已过保留期）
+    # 全天无数据：清理 tmp
     if tmp.exists():
         tmp.unlink()
-    marker = _empty_marker_path(trade_date)
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text("")
+    # 当日可能只是盘后尚未就绪，不写 .empty（否则 verify 会当作"已确认无数据"不再重试）；
+    # 仅历史日写 .empty（多为已过保留期/无数据），避免反复重试。
+    if trade_date != datetime.datetime.now().strftime("%Y%m%d"):
+        marker = _empty_marker_path(trade_date)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("")
     return DayResult(len(codes), 0, 0, "unavailable")
 
 
@@ -388,10 +391,12 @@ def _fmt_days(days: List[str], limit: int = 10) -> str:
 def run(run_date: str | None = None, **kwargs) -> str:
     """每日任务：采集指定日期全部 A 股 tick → 当日打包 parquet。
 
-    不传 run_date 时自动取上一交易日（当天 tick 经常无法获取，故默认昨日）。
+    不传 run_date 时默认取**当天**（盘后采集当日 tick）。
+    注意：当日 tick 可能盘后稍晚才就绪；若暂不可用，本任务**不写 .empty 标记**，
+    交由 weekly_tick_verify 或下次运行补采，避免把"尚未就绪"误标为"无数据"。
     """
     if run_date is None or str(run_date).strip() == "":
-        trade_date = minus_one_market_day(datetime.datetime.now())
+        trade_date = datetime.datetime.now().strftime("%Y%m%d")
     else:
         trade_date = normalize_trade_date(run_date)
     limit_stocks = kwargs.get("limit_stocks")
@@ -403,6 +408,11 @@ def run(run_date: str | None = None, **kwargs) -> str:
     if r.status == "skipped":
         return f"{trade_date} Tick当日文件已存在，跳过。"
     if r.status == "unavailable":
+        if trade_date == datetime.datetime.now().strftime("%Y%m%d"):
+            return (
+                f"{trade_date} 当日 Tick 暂不可用（盘后可能尚未就绪），"
+                f"未写 .empty，将由 verify/下次运行补采。"
+            )
         return f"{trade_date} Tick无数据（可能已过QMT保留期），已写 .empty 标记。"
     return (
         f"{trade_date} Tick完成，{r.with_data}/{r.stocks} 只有数据，"

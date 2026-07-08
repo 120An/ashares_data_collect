@@ -1,5 +1,5 @@
 """
-数据采集任务 CLI 入口
+数据采集任务 CLI 入口（**行情专用**：股票/ETF K线、财务、tick 等）
 
 用法：
   python run_job.py --mode pipeline [--date YYYYMMDD] [--task NAME]
@@ -8,6 +8,10 @@
   python run_job.py --mode export-only [--date YYYYMMDD] [--limit-stocks N]
   python run_job.py --mode scheduler [--hour H] [--minute M]
   python run_job.py --mode test
+
+新闻采集系统（news_flash/news_hourly/news_daily/news_stock）由独立入口
+**run_news.py** 调度/执行——本入口 scheduler 缺省不注册新闻管线、显式传新闻名报错，
+两套调度职责分离（可分别部署在 Windows 行情机 / Linux 新闻机）。
 """
 
 from __future__ import annotations
@@ -21,6 +25,16 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+
+# 新闻系统管线（独立入口 run_news.py 专管；run_news 从此处导入保持单一事实源）
+NEWS_PIPELINES = ("news_flash", "news_hourly", "news_daily", "news_stock")
+
+
+def _news_task_names() -> set:
+    """新闻管线下的全部任务名（run_job 各模式拒绝它们；run_news 用它收窄）。"""
+    from data_collect.config import get_pipeline_config
+    return {t["name"] for n, c in get_pipeline_config().items()
+            if n in NEWS_PIPELINES for t in c.get("tasks", [])}
 
 
 def _require_blocking_scheduler():
@@ -53,8 +67,9 @@ def start_scheduler(
 ) -> None:
     """启动 BlockingScheduler，注册所有有 schedule 段的 pipeline。
 
-    pipeline_name=None：注册全部 pipeline；指定时仅注册该 pipeline。
-    hour/minute 仅在指定单 pipeline 时生效（覆盖配置）。
+    pipeline_name=None：注册全部 pipeline；指定时仅注册指定的（**支持逗号分隔多个**，
+    如 "news_flash,news_hourly,news_daily,news_stock"——新闻系统在 Linux 上单独调度）。
+    hour/minute 仅在恰好指定一个 pipeline 时生效（覆盖配置）。
     """
     from data_collect.pipeline import run_pipeline, print_dag
     from data_collect.config import get_pipeline_config
@@ -62,10 +77,12 @@ def start_scheduler(
     pipelines = get_pipeline_config()
 
     if pipeline_name:
-        if pipeline_name not in pipelines:
-            print(f"错误：pipeline '{pipeline_name}' 不存在，可用: {list(pipelines.keys())}")
+        names = [n.strip() for n in str(pipeline_name).split(",") if n.strip()]
+        unknown = [n for n in names if n not in pipelines]
+        if unknown:
+            print(f"错误：pipeline {unknown} 不存在，可用: {list(pipelines.keys())}")
             return
-        targets = {pipeline_name: pipelines[pipeline_name]}
+        targets = {n: pipelines[n] for n in names}
     else:
         targets = {n: c for n, c in pipelines.items() if c.get("schedule")}
 
@@ -80,7 +97,8 @@ def start_scheduler(
 
     for name, cfg in targets.items():
         sch = cfg.get("schedule", {})
-        if pipeline_name and (hour is not None or minute is not None):
+        # hour/minute 覆盖只在恰好一个 pipeline 时生效（多管线各有各的 cron，覆盖无意义）
+        if len(targets) == 1 and (hour is not None or minute is not None):
             cron_kwargs = _build_cron_kwargs(sch, hour, minute)
         else:
             cron_kwargs = _build_cron_kwargs(sch)
@@ -170,7 +188,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--pipeline", default=None,
-        help="指定 pipeline 名称（pipeline/once 模式默认 daily；scheduler 模式默认全部注册）",
+        help="指定 pipeline 名称（pipeline/once 模式默认 daily；scheduler 模式默认全部注册，"
+             "支持逗号分隔多个，如 news_flash,news_hourly,news_daily,news_stock）",
     )
     parser.add_argument(
         "--hour", type=int, default=None,
@@ -195,13 +214,29 @@ def main() -> None:
         return
 
     if args.mode == "scheduler":
-        start_scheduler(pipeline_name=args.pipeline, hour=args.hour, minute=args.minute)
+        if args.pipeline:
+            names = [n.strip() for n in str(args.pipeline).split(",") if n.strip()]
+            news = [n for n in names if n in NEWS_PIPELINES]
+            if news:
+                print(f"错误：{news} 属新闻系统，run_job.py 只管行情——请用 run_news.py 调度")
+                return
+            start_scheduler(pipeline_name=args.pipeline, hour=args.hour, minute=args.minute)
+        else:
+            # 缺省只注册行情管线；新闻四管线由独立入口 run_news.py 调度（职责分离）
+            from data_collect.config import get_pipeline_config
+            market = [n for n, c in get_pipeline_config().items()
+                      if c.get("schedule") and n not in NEWS_PIPELINES]
+            start_scheduler(pipeline_name=",".join(market))
         return
 
     if args.mode == "pipeline":
+        target = args.pipeline or "daily"
+        if target in NEWS_PIPELINES:
+            print(f"错误：'{target}' 属新闻系统——请用 run_news.py --mode pipeline 执行")
+            return
         from data_collect.pipeline import run_pipeline
         results = run_pipeline(
-            pipeline_name=args.pipeline or "daily",
+            pipeline_name=target,
             run_date=args.date,
             only_task=args.task,
             limit_stocks=args.limit_stocks,
@@ -215,6 +250,9 @@ def main() -> None:
         if not args.task:
             print("错误：backfill 模式必须指定 --task")
             return
+        if args.task in _news_task_names():
+            print(f"错误：'{args.task}' 属新闻系统——请用 run_news.py --mode backfill")
+            return
         if not args.start or not args.end:
             print("错误：backfill 模式必须指定 --start 和 --end")
             return
@@ -224,6 +262,9 @@ def main() -> None:
     if args.mode == "verify":
         if not args.task:
             print("错误：verify 模式必须指定 --task")
+            return
+        if args.task in _news_task_names():
+            print(f"错误：'{args.task}' 属新闻系统——请用 run_news.py --mode verify")
             return
         if not args.start or not args.end:
             print("错误：verify 模式必须指定 --start 和 --end")

@@ -41,3 +41,20 @@ def send_dingtalk(message: str) -> None:
         _post_dingtalk(url, payload)
     except Exception as exc:
         logger.error(f"钉钉通知发送失败（重试耗尽）: {exc}")
+
+
+def guarded_send(message: str, send=None) -> bool:
+    """守护式发送：包裹 send_dingtalk，成功返回 True、异常返回 False（仅记日志）。
+
+    send_dingtalk 自身已吞掉 POST 错误，本函数主要挡配置/前缀等异常，并提供
+    bool 返回值（快讯断流告警状态机据此判定是否置 alerted）。`send` 可注入调用方
+    模块级的 send_dingtalk（保留其 monkeypatch 点），缺省用本模块的 send_dingtalk。
+    """
+    if send is None:
+        send = send_dingtalk
+    try:
+        send(message)
+        return True
+    except Exception:
+        logger.warning(f"钉钉发送失败（不阻塞主流程）: {message[:60]}", exc_info=True)
+        return False

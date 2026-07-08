@@ -306,13 +306,28 @@ def run_pipeline(
         if not result.success:
             failed_tasks.add(task_name)
 
-    _send_pipeline_summary(pipeline_name, run_date, results)
+    if _should_notify(pipeline_cfg, results):
+        _send_pipeline_summary(pipeline_name, run_date, results)
     return results
+
+
+def _should_notify(pipeline_cfg: Dict[str, Any], results: List[TaskResult]) -> bool:
+    """通知策略：pipeline 配 `notify: on_failure` 且**全部成功**时静默（不发汇总），
+    用于高频 pipeline（如 news_flash */15）避免钉钉刷屏；有失败照发。缺省（无 notify）维持总发。
+
+    注意：任务重试的告警由 `_notify_retry` 独立发送，不受本策略影响——"失败可见"仍成立。
+    平台不匹配跳过 success=True 不算失败；上游失败导致的跳过 success=False 算失败。
+    """
+    if pipeline_cfg.get("notify") == "on_failure":
+        return any(not r.success for r in results)
+    return True
 
 
 def _send_pipeline_summary(pipeline_name: str, run_date: str | None, results: List[TaskResult]) -> None:
     """发送 pipeline 执行汇总通知。"""
-    lines = [f"流水线 [{pipeline_name}] 执行完毕 (日期: {run_date or '今天'})"]
+    # 未显式传日期时（scheduler 定时触发即如此）标注实际日期，便于事后核查
+    date_label = run_date or f"今天 {datetime.datetime.now().strftime('%Y%m%d')}"
+    lines = [f"流水线 [{pipeline_name}] 执行完毕 (日期: {date_label})"]
     for r in results:
         if r.skipped:
             status = "⏭跳过"

@@ -1,11 +1,11 @@
-# Project config (contains credentials)
-config.yaml
-
 # 草稿 / 探索 notebook（不入库）
 tests/test.ipynb
 
 # CSV export output
 tempdata/
+
+# 新闻归档 NAS 不可用时的本地 spool 降级目录（flush_spool 自动搬回，不入库）
+news_spool/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

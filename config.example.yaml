@@ -23,6 +23,28 @@ qmt:
   # QMT 安装目录；清理任务清空 {install_dir}\userdata_mini\datadir（本地行情缓存）
   install_dir: "D:\\国金QMT交易端模拟"
 
+# 新闻系统（见 docs/superpowers/specs/2026-07-02-news-opensearch-plan.md）
+opensearch:
+  host: "192.168.x.x"
+  port: 9200
+  use_ssl: true
+  verify_certs: false            # 内网自签证书
+  user: "news_writer"            # 专用最小权限账号（news* 索引 CRUD + cluster_monitor）
+  password: "your_password"
+
+news:
+  archive_base: "Z:\\A股冷数据\\news"     # 原始归档层（其下 raw/ 等子目录）
+  # spool_dir: "D:\\path\\to\\news_spool"  # 可选，NAS 故障时本地暂存目录（缺省 <项目根>/news_spool）
+  verify_days_back: 3                    # verify 自然日回溯天数
+  embedding:
+    backend: "local"                     # local(sentence-transformers) | ollama
+    model: "BAAI/bge-m3"                 # local=HF 名；ollama 时用 Ollama 模型名（如 "bge-m3"）
+    device: "cpu"
+    batch_size: 32
+    # ollama_url: "http://192.168.9.12:11434"  # backend=ollama 时必填
+  watch_stocks: []                       # 个股新闻关注池（二期）
+  rss_sources: []                        # RSSHub/RSS 源清单（二期）
+
 pipelines:
   # 每日 15:30 主流水线
   daily:
@@ -79,6 +101,36 @@ pipelines:
         depends_on: [a_share_index_weight]
         timeout: 2400
         retries: 1
+      # ETF 采集（接在股票任务之后，串行链；etf_nav 走 akshare 跨平台）
+      - name: etf_daily
+        job: data_collect.jobs.etf_daily
+        platform: windows
+        depends_on: [a_share_tick]
+        timeout: 900
+        retries: 1
+      - name: etf_minute
+        job: data_collect.jobs.etf_minute
+        platform: windows
+        depends_on: [etf_daily]
+        timeout: 1800
+        retries: 1
+      - name: etf_divid_factors
+        job: data_collect.jobs.etf_divid_factors
+        platform: windows
+        depends_on: [etf_minute]
+        timeout: 600
+        retries: 1
+      - name: etf_info
+        job: data_collect.jobs.etf_info
+        platform: windows
+        depends_on: [etf_divid_factors]
+        timeout: 900
+        retries: 1
+      - name: etf_nav
+        job: data_collect.jobs.etf_nav
+        depends_on: [etf_info]
+        timeout: 600
+        retries: 1
 
   # 周六 8:00 — tick 查漏补缺最近 5 个交易日
   weekly_tick_verify:
@@ -118,6 +170,26 @@ pipelines:
         days_back: 10
         timeout: 3600
         retries: 1
+      - name: etf_daily
+        job: data_collect.jobs.etf_daily
+        platform: windows
+        fn: run_verify
+        days_back: 10
+        timeout: 1800
+        retries: 1
+      - name: etf_minute
+        job: data_collect.jobs.etf_minute
+        platform: windows
+        fn: run_verify
+        days_back: 10
+        timeout: 3600
+        retries: 1
+      - name: etf_nav
+        job: data_collect.jobs.etf_nav
+        fn: run_verify
+        days_back: 5
+        timeout: 1800
+        retries: 1
 
   # 每月最后一天 23:00 — 财务数据更新
   monthly_financial:
@@ -146,3 +218,49 @@ pipelines:
         platform: windows
         timeout: 1800
         retries: 0
+
+  # 新闻快讯 */15 分钟（成功静默，失败照发）
+  news_flash:
+    schedule: {minute: "*/15", timezone: "Asia/Shanghai"}
+    notify: on_failure
+    tasks:
+      - {name: news_flash, job: data_collect.jobs.news_flash, timeout: 240, retries: 1}
+
+  # 新闻小时级 :37 错峰——个股全文 → 公告PDF → 补向量（串行避免带宽争抢）
+  news_hourly:
+    schedule: {minute: 37, timezone: "Asia/Shanghai"}
+    notify: on_failure
+    tasks:
+      - {name: news_fulltext, job: data_collect.jobs.news_fulltext, timeout: 1800, retries: 1}
+      - {name: news_announce_pdf, job: data_collect.jobs.news_announce_pdf, timeout: 1800,
+         retries: 1, depends_on: [news_fulltext]}
+      - {name: news_embed, job: data_collect.jobs.news_embed, timeout: 900, retries: 1,
+         depends_on: [news_announce_pdf]}
+
+  # 新闻每日 20:40——联播采集+verify+快讯重放+日报（保留成功汇总）
+  # 注：news 系 verify 忽略框架交易日窗口，按 news.verify_days_back 自然日回溯，故不写 days_back（框架不透传，写了是死配置）
+  news_daily:
+    schedule: {hour: 20, minute: 40, timezone: "Asia/Shanghai"}
+    tasks:
+      - {name: news_cctv, job: data_collect.jobs.news_cctv, timeout: 300, retries: 2}
+      - {name: news_cctv_verify, job: data_collect.jobs.news_cctv, fn: run_verify,
+         timeout: 300, retries: 0, depends_on: [news_cctv]}
+      - {name: news_flash_verify, job: data_collect.jobs.news_flash, fn: run_verify,
+         timeout: 600, retries: 0}
+      # 公告采集（单查询全市场）+ verify 自然日回溯补昨日
+      - {name: news_announcement, job: data_collect.jobs.news_announcement,
+         timeout: 600, retries: 1}
+      - {name: news_announcement_verify, job: data_collect.jobs.news_announcement,
+         fn: run_verify, timeout: 600, retries: 0, depends_on: [news_announcement]}
+      # 只读别名快照、必达（不依赖 verify 产出）；不设 depends_on 以免 verify raise 时被跳过；
+      # input-order 使其仍排在 news_daily 末位运行（计数新鲜）
+      - {name: news_report, job: data_collect.jobs.news_report,
+         timeout: 120, retries: 0}
+
+  # 个股新闻 22:00——全市场逐票扫描(每票10条) + 自然日归档重放 verify
+  news_stock:
+    schedule: {hour: 22, minute: 0, timezone: "Asia/Shanghai"}
+    tasks:
+      - {name: news_stock, job: data_collect.jobs.news_stock, timeout: 7200, retries: 1}
+      - {name: news_stock_verify, job: data_collect.jobs.news_stock, fn: run_verify,
+         timeout: 900, retries: 0, depends_on: [news_stock]}
