@@ -31,11 +31,17 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 from opensearchpy.exceptions import AuthorizationException, NotFoundError
 
+from data_collect.config import get_news_config
 from data_collect.utils import opensearch_utils as osu
 from data_collect.utils.embedding import get_embedder
 from data_collect.utils.news_normalize import clean_text
 
 logger = logging.getLogger(__name__)
+
+
+def _embedding_enabled() -> bool:
+    """向量是否启用（config news.embedding.enabled，缺省 true）。"""
+    return bool((get_news_config().get("embedding") or {}).get("enabled", True))
 
 _MODES = ("hybrid", "rrf", "bm25", "knn")
 
@@ -309,6 +315,13 @@ def search_news(query, top_k: int = 10, channel=None, date_range=None, stocks=No
         raise ValueError(f"查询串清洗后为空: {query!r}")
     if mode not in _MODES:
         raise ValueError(f"未知 mode: {mode!r}（支持 {'/'.join(_MODES)}）")
+
+    # 向量延迟（news.embedding.enabled=false）时全库无 content_vec，knn/hybrid/rrf
+    # 会静默返回空/退化——**降级为 bm25** 保证消费方总有结果（日后补算向量即恢复
+    # 语义路）。2026-07-08 部署审查：读侧原不知延迟标志，是唯一的静默失败缺口。
+    if mode in ("knn", "hybrid", "rrf") and not _embedding_enabled():
+        logger.warning(f"向量已禁用（news.embedding.enabled=false）→ mode={mode} 降级 bm25")
+        mode = "bm25"
 
     filters, must_not = _build_filters(channel, date_range, stocks)
     client = osu.get_client()

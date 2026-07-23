@@ -28,10 +28,12 @@ from data_collect.utils import opensearch_utils as osu
 from data_collect.utils.news_common import cell as _cell
 from data_collect.utils.news_common import flush_spool_safe as _flush_spool_safe
 from data_collect.utils.news_common import fmt_truncated as _fmt_items
+from data_collect.utils.news_common import now as _now
 from data_collect.utils.news_common import strip_raw as _strip_raw
 from data_collect.utils.news_common import today as _today
 from data_collect.utils.news_common import verify_dates as _verify_dates
 from data_collect.utils.notify import send_dingtalk
+from data_collect.utils import source_registry
 
 logger = logging.getLogger(__name__)
 
@@ -208,10 +210,12 @@ def run(run_date: str | None = None, **kwargs) -> str:
     日期归属由每条 pub_time 决定，窗口跨日）。全市场码取失败（DB 挂）直接上抛 →
     框架 retry；逐码采集异常隔离；全市场全失败 raise（触发框架 retry + 钉钉）。
     """
+    if not source_registry.is_enabled(_SOURCE):   # 注册表 kill-switch（二期）
+        return f"个股新闻: 源 {_SOURCE} 已在注册表禁用（enabled=false），跳过"
     _flush_spool_safe()
     codes = nn.load_a_share_codes()          # DB 挂则抛 → 框架 retry
     name_dict = _load_name_dict()            # 降级空 dict + 告警
-    fetch_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    fetch_time = _now().strftime("%Y-%m-%d %H:%M:%S")   # 统一 _now（审查 S6）
 
     by_url, failed = _sweep(codes)
     envelopes = [env for url, entry in by_url.items()

@@ -139,6 +139,28 @@ def save_to_postgres(
     return len(rows), affected_rows
 
 
+def replace_day_then_insert(table: str, trade_date, df: pd.DataFrame,
+                            date_column: str = "trade_date") -> Tuple[int, int]:
+    """按日替换写入：先 DELETE 当日再插入（快照类数据自愈语义）。
+
+    适用盘中滚动、收盘定格的快照表（limit_pool/etf_option_daily/fund_flow_daily）：
+    盘中误跑/重跑都会被下一次运行整日替换修正。df 空则只删不插。
+    坑：float64 NaN 进 INTEGER 列会报 NumericValueOutOfRange（psycopg2 按 float
+    适配 NaN，PG 拒 NaN→integer；DOUBLE 列收 NaN 合法故老表未暴露）→ 整帧转
+    object + NaN→None（NULL 语义亦更正确）。
+    """
+    validate_table_name(table)
+    day = pd.to_datetime(trade_date).date()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f'DELETE FROM "{table}" WHERE "{date_column}" = %s', (day,))
+        conn.commit()
+    if df is None or df.empty:
+        return 0, 0
+    df = df.astype(object).where(pd.notna(df), None)
+    return save_to_postgres(df, pre_aligned_df=None, table_name=table)
+
+
 def has_data_for_date(table: str, date_column: str, trade_date: str) -> bool:
     """检查指定表在指定日期是否有数据。"""
     validate_table_name(table)

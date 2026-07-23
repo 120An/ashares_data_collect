@@ -111,7 +111,20 @@ def print_dag(pipeline_name: str = "daily") -> None:
 
 
 def _call_job_fn(job_path: str, fn_name: str, **kwargs):
-    """在子进程中调用 job 模块的指定函数（被 submit 到 ProcessPoolExecutor）。"""
+    """在子进程中调用 job 模块的指定函数（被 submit 到 ProcessPoolExecutor）。
+
+    子进程在 Windows(spawn)/POSIX 下是全新进程，不继承主进程的 logging 配置，
+    root logger 默认 WARNING → 各 job 的 logger.info（"快讯源 X 本轮 N 条""扫 pending
+    M 篇"等现场进度）全部被吞。任务超时/崩溃时错误里只有主进程的调度日志，看不到
+    子进程走到哪一步（news_fulltext worker abruptly terminated 无法定位即此盲区）。
+    故在子进程入口配置 INFO 级 basicConfig，stdout 经 ProcessPoolExecutor 回流主进程
+    即可见。"""
+    import logging as _logging
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     module = importlib.import_module(job_path)
     fn = getattr(module, fn_name, None)
     if fn is None:
@@ -162,7 +175,7 @@ def execute_in_subprocess(
             timed_out = True
             _kill_executor_workers(executor)
             raise TimeoutError(
-                f"任务执行超时（{timeout}s）— xtquant/外部依赖可能挂死，已强杀子进程"
+                f"任务执行超时（{timeout}s）— 外部依赖/网络请求可能挂死，已强杀子进程"
             )
     finally:
         if timed_out:

@@ -22,16 +22,32 @@ _TIMEOUT = 20
 _MIN_BODY = 120        # 抽取后正文过短（stub/付费墙提示页）→ 视为失败
 
 
+def _smart_text(resp) -> str:
+    """响应头无 charset 时改用 apparent_encoding 解码（chardet 探测）。
+
+    背景（2026-07-08 csrc/pbc 实撞）：政府站响应头常只给 `text/html` 不带
+    charset，requests 按 RFC 缺省 ISO-8859-1 解码 → 中文全乱码（乱码文档一旦
+    create-only 入库，同 _id 永远无法覆盖，只能删后重采）。header 带 charset
+    的站点保持原行为不变。
+    """
+    ctype = (resp.headers.get("Content-Type") or "")
+    if "charset" not in ctype.lower():
+        apparent = getattr(resp, "apparent_encoding", None)
+        if apparent:
+            resp.encoding = apparent
+    return resp.text
+
+
 def _get_via_requests(url: str) -> tuple[int, str]:
     import requests
     r = requests.get(url, headers=_HEADERS, timeout=_TIMEOUT)
-    return r.status_code, r.text
+    return r.status_code, _smart_text(r)
 
 
 def _get_via_curl(url: str) -> tuple[int, str]:
     from curl_cffi import requests as creq
     r = creq.get(url, headers=_HEADERS, timeout=_TIMEOUT, impersonate="chrome120")
-    return r.status_code, r.text
+    return r.status_code, _smart_text(r)   # 同 requests 路径：无 charset 头按探测编码解码
 
 
 def _http_get(url: str) -> str | None:

@@ -108,3 +108,27 @@ def get_etf_codes(sectors: List[str] | None = None, exclude_money: bool = False)
         bare = {b for b in bare if b[:3] not in ("511",) and b not in ("159001", "159003", "159005")}
 
     return sorted(with_suffix(b) for b in bare)
+
+
+_INDEX_SECTORS = ["沪深指数"]          # 实测含沪 221 + 深 388（609 个）
+_INDEX_EXTRA = ["899050.BJ"]           # 北证50 不在任何指数板块，手工补
+_INDEX_EXCLUDE_PREFIX = ("395",)       # sz395* 段 QMT 无数据（实测 14 个全空）；QMT 补数据后删此行即放开
+
+
+def get_index_codes() -> List[str]:
+    """获取全市场指数代码列表（带点，如 000300.SH）。
+
+    依赖本地板块缓存（同 get_etf_codes）：需先 download_sector_data()——由 pipeline 的
+    a_share_sector 任务或首次手动执行；**不在此内联下载**（无超时曾挂死）。
+    并入北证50、剔除 395* 段（裸码前缀判定）、去重排序。
+    """
+    xtdata = require_xtdata()
+    merged = set()
+    for sec in _INDEX_SECTORS:
+        try:
+            merged.update(xtdata.get_stock_list_in_sector(sec) or [])
+        except Exception as exc:
+            logger.warning(f"读取指数板块 {sec} 失败: {exc}")
+    merged.update(_INDEX_EXTRA)
+    result = {c for c in merged if not c.split(".")[0].startswith(_INDEX_EXCLUDE_PREFIX)}
+    return sorted(result)

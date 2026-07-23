@@ -27,7 +27,7 @@ logging.basicConfig(
 )
 
 # 新闻系统管线（独立入口 run_news.py 专管；run_news 从此处导入保持单一事实源）
-NEWS_PIPELINES = ("news_flash", "news_hourly", "news_daily", "news_stock")
+NEWS_PIPELINES = ("news_flash", "news_hourly", "news_daily", "news_stock", "news_us")
 
 
 def _news_task_names() -> set:

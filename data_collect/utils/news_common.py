@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import threading
 
 import pandas as pd
 
@@ -27,6 +28,19 @@ def today() -> datetime.date:
 def now() -> datetime.datetime:
     """当前时间。独立成函数便于测试 monkeypatch 固定时钟。"""
     return datetime.datetime.now()
+
+
+def normalize_date8(raw) -> str:
+    """CLI --date 归一化为 YYYYMMDD：接受 YYYYMMDD 或 YYYY-MM-DD，异形响亮报错。
+
+    run_job.py/run_news.py 的 --date 明示支持带横杠形态；不归一化则下游切片拼出
+    畸形 pub_time / seDate / 404 URL（news_cctv/news_report 手动补跑曾中招），比报错
+    更糟——静默产错数据。各 job 的 run 统一复用本函数（news_announcement 首用）。
+    """
+    s = str(raw).strip().replace("-", "")
+    if len(s) != 8 or not s.isdigit():
+        raise ValueError(f"日期需为 YYYYMMDD 或 YYYY-MM-DD，收到: {raw!r}")
+    return s
 
 
 def cell(value) -> str:
@@ -71,6 +85,33 @@ RAW_ONLY_KEYS = ("raw_title", "raw_content", "time_estimated")
 def strip_raw(envelope: dict) -> dict:
     """入库前剥除只进归档的键（RAW_ONLY_KEYS，见上）。"""
     return {k: v for k, v in envelope.items() if k not in RAW_ONLY_KEYS}
+
+
+def fetch_with_timeout(fetch_fn, timeout_seconds: float, label: str = "拉取"):
+    """守护线程包裹的硬超时拉取：超时抛 TimeoutError → 调用方按"源失败"隔离。
+
+    背景（news_flash cls 2026-07-08 实撞）：akshare/requests 类源函数普遍不设
+    timeout，源端挂起不抛异常纯阻塞——源级隔离只兜"异常"兜不住"挂起"，会拖满
+    任务级 timeout 被硬杀、健康源没机会跑。用 daemon Thread 而非
+    ThreadPoolExecutor：后者工作线程非守护且注册 atexit join，挂死线程会把
+    "挂起"传染给解释器退出（子进程永不落地）。
+    """
+    result: dict = {}
+
+    def _target():
+        try:
+            result["value"] = fetch_fn()
+        except Exception as exc:  # noqa: BLE001 —— 存起来在主线程原样重抛
+            result["exc"] = exc
+
+    worker = threading.Thread(target=_target, daemon=True)
+    worker.start()
+    worker.join(timeout_seconds)
+    if worker.is_alive():
+        raise TimeoutError(f"{label}超过 {timeout_seconds}s（源挂起，按源失败隔离）")
+    if "exc" in result:
+        raise result["exc"]
+    return result.get("value")
 
 
 def verify_dates(days_back, today_date: datetime.date,

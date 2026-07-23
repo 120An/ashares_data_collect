@@ -30,6 +30,8 @@ from __future__ import annotations
 import gzip
 import json
 import logging
+import os
+import re
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -50,9 +52,42 @@ _ALERT_MARKER_NAME = ".nas_alert_ts"
 _ALERT_TTL_SECONDS = 4 * 3600
 
 
+def _is_posix() -> bool:
+    """当前是否 POSIX 系统（独立函数便于单测打桩，勿直接 patch os.name——那会
+    污染全局 os 使 pathlib 选错 Path 实现）。"""
+    return os.name == "posix"
+
+
+def _assert_not_windows_drive(raw: str) -> None:
+    """POSIX 上拒绝 Windows 盘符路径（如 ``Z:\\...``）——**响亮失败**。
+
+    背景（2026-07-08 部署审查）：Linux 上 ``Path("Z:\\A股冷数据\\news")`` 是**单层
+    相对**路径（反斜杠是合法文件名字符、``Z:`` 不是盘符），mkdir 会静默成功，把
+    归档写进 CWD 下的垃圾目录——而归档是快讯/政策/监管的**唯一存档**（滚动窗源头
+    不可回补），静默走错路 = 数据看着采到了、实则备份全丢在错地方。
+    """
+    if re.match(r"^[A-Za-z]:[\\/]", raw):
+        raise RuntimeError(
+            f"news 归档根 {raw!r} 是 Windows 盘符路径，但当前是 Linux/Unix——"
+            f"归档会静默写进 CWD 垃圾目录（唯一存档丢失）。请配置 "
+            f"news.archive_base_posix 为 POSIX 挂载点（如 /mnt/media/A股冷数据/news）")
+
+
 def _archive_root() -> Path:
-    """NAS 归档根目录：config `news.archive_base`（其下 raw/ 子目录）。"""
-    return Path(get_news_config()["archive_base"])
+    """NAS 归档根目录（其下 raw/ 子目录）。**平台感知**：POSIX 用
+    `news.archive_base_posix`（Linux 挂载点），Windows 用 `news.archive_base`
+    （盘符路径）——一份 config 两台机器通用，无需按机器改路径（2026-07-09）。
+    """
+    cfg = get_news_config()
+    if _is_posix():
+        raw = cfg.get("archive_base_posix")
+        if not raw:
+            raise RuntimeError(
+                "当前是 Linux/Unix，但 news.archive_base_posix 未配置——请填 SMB/NAS "
+                "的 POSIX 挂载点（如 /mnt/media/A股冷数据/news），见部署文档")
+        _assert_not_windows_drive(str(raw))
+        return Path(raw)
+    return Path(cfg["archive_base"])
 
 
 def _spool_root() -> Path:

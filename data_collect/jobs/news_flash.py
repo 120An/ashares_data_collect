@@ -1,8 +1,9 @@
 """7×24 财经快讯双活采集任务（新闻系统架构 §4.2）。
 
-数据源**双活**（akshare）：``stock_info_global_cls``（财联社电报，滚动窗约数百条）
-+ ``stock_info_global_em``（东财全球财经快讯，滚动窗约 200 条）。两源均为**滚动
-窗口接口——无日期参数、错过无法从源回补**，归档层对快讯就是唯一存档（架构 §4.4），
+数据源**三备**：``cls``（财联社电报，2026-07 起直连官方 v1 API + 本地签名，见
+_fetch_cls；akshare 旧路径挂死已弃）+ ``em``（东财全球快讯，akshare）+ ``sina``
+（新浪，akshare）。各源均为**滚动窗口接口——无日期参数、错过无法从源回补**，
+归档层对快讯就是唯一存档（架构 §4.4），
 因此本 job 的健壮性机制多于同族 news_cctv：
 
 1. **源级隔离**：单源采集异常只计失败源继续（双活的意义），双源全挂才 raise
@@ -24,12 +25,14 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import logging
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import pandas as pd
+import requests
 
 from data_collect.config import get_news_config
 from data_collect.utils import news_archive
@@ -37,6 +40,7 @@ from data_collect.utils import news_normalize as nn
 from data_collect.utils import notify
 from data_collect.utils import opensearch_utils as osu
 from data_collect.utils.news_common import cell as _cell
+from data_collect.utils.news_common import fetch_with_timeout as _fetch_with_timeout_core
 from data_collect.utils.news_common import flush_spool_safe as _flush_spool_safe
 from data_collect.utils.news_common import fmt_truncated as _fmt_items
 from data_collect.utils.news_common import strip_raw as _strip_raw
@@ -49,11 +53,18 @@ logger = logging.getLogger(__name__)
 # 项目根：data_collect 包上一级（.../data_collect/jobs/news_flash.py → parents[2]）
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-# 双活源（也是归档目录名与信封 source 值）；顺序即采集/摘要顺序
-_SOURCES = ("cls", "em")
+# 缺省双活源（也是归档目录名与信封 source 值）；顺序即采集/摘要顺序。
+# 实际生效列表由 config `news.flash_sources` 驱动（见 _active_sources）——
+# 源挂死时（如 2026-07-08 cls 事故）改配置即可切换 [em, sina]，零代码。
+_DEFAULT_SOURCES = ("cls", "em")
 
 # 断流判定：某源连续 N 轮 0 条新数据 → 告警（*/15 调度下 8 轮 ≈ 2 小时）
 _SILENCE_ROUNDS = 8
+
+# 溢出告警豁免源：窗口极小（sina≈20 条）而发文快（实测 ~17.5 条/15min 均值），
+# 高峰期整窗全新是**常态而非事故**，告警零信息量且刷屏（2026-07-23 用户反馈一天
+# 几十条）。真正防丢主力是 em(窗口~200)+cls(50)，sina 仅三备兜底。
+_OVERFLOW_ALERT_EXEMPT = frozenset({"sina"})
 
 # 断流监测状态文件名（落 spool 根目录，与 news_archive 降级 spool 同址）
 _STATE_FILE_NAME = ".flash_source_state.json"
@@ -67,17 +78,85 @@ _STATE_FILE_NAME = ".flash_source_state.json"
 _REQUIRED_COLUMNS: Dict[str, Tuple[str, ...]] = {
     "cls": ("标题", "内容", "发布日期", "发布时间"),
     "em": ("标题", "摘要", "发布时间", "链接"),
+    "sina": ("时间", "内容"),   # 三备（spec §4.2）：无标题无链接，窗口约 20 条
 }
 
 
-def _fetch_cls() -> pd.DataFrame:
-    """拉取财联社电报滚动窗（symbol=全部）。
+def _active_sources() -> Tuple[str, ...]:
+    """生效源列表：config `news.flash_sources` 驱动（换源/停源零代码），缺省双活。
 
-    lazy import：akshare 导入慢且依赖重；测试 monkeypatch 本函数即可隔离网络。
+    未知源名直接抛错——配置手误若静默跳过等于静默停采（fail-fast 契约）。
     """
-    import akshare as ak
+    configured = get_news_config().get("flash_sources")
+    if not configured:
+        return _DEFAULT_SOURCES
+    sources = tuple(str(s).strip() for s in configured if str(s).strip())
+    unknown = [s for s in sources if s not in _REQUIRED_COLUMNS]
+    if unknown:
+        raise ValueError(
+            f"news.flash_sources 含未知源 {unknown}（可用: {list(_REQUIRED_COLUMNS)}）")
+    return sources or _DEFAULT_SOURCES
 
-    return ak.stock_info_global_cls(symbol="全部")
+
+# 单源拉取硬超时（秒）：akshare 内部 requests 普遍不设 timeout，源端挂起（黑洞连接/
+# 代理规则异常）不抛异常纯阻塞——源级隔离只兜"异常"兜不住"挂起"，会拖满任务级
+# timeout 被硬杀、健康源也没机会跑（2026-07-08 cls 实撞）。60s 对滚动窗接口绰绰有余。
+_FETCH_TIMEOUT_SECONDS = 60
+
+
+def _fetch_with_timeout(fetch_fn):
+    """薄包装：flash 常量 + 共享核心 news_common.fetch_with_timeout（提炼后）。"""
+    return _fetch_with_timeout_core(fetch_fn, _FETCH_TIMEOUT_SECONDS, "快讯源拉取")
+
+
+_CLS_URL = "https://www.cls.cn/v1/roll/get_roll_list"
+_CLS_TZ = datetime.timezone(datetime.timedelta(hours=8))   # 北京时间（不依赖机器时区）
+
+
+def _cls_sign(params: Dict[str, str]) -> str:
+    """cls v1 API 本地签名：md5(sha1(按 key 字典序拼接的 query 串))，零 key。
+
+    纯函数可单测；与传入字典顺序无关（内部字典序排序）。
+    """
+    qs = "&".join(f"{k}={params[k]}" for k in sorted(params))
+    return hashlib.md5(hashlib.sha1(qs.encode()).hexdigest().encode()).hexdigest()
+
+
+def _fetch_cls() -> pd.DataFrame:
+    """拉取财联社电报滚动窗（直连官方 v1 API + 本地签名）。
+
+    2026-07 复活：akshare 旧路径（nodeapi）源头挂死/无超时纯阻塞（2026-07-08 事故），
+    改直连 `v1/roll/get_roll_list`——强制 sign 校验但纯本地可算（见 _cls_sign），
+    显式 timeout=10 拔除挂死病根（外层 fetch_with_timeout 60s 双保险仍在）。
+    输出列契约与 _REQUIRED_COLUMNS["cls"] 一致（标题/内容/发布日期date/发布时间time），
+    下游归一化/_id/归档零改动。测试 monkeypatch 模块级 requests.get 即可隔离网络。
+    """
+    # rn 服务端上限 50：>50 时 errno=0 但 roll_data 静默为空（2026-07-22 实测），勿调大
+    params = {"appName": "CailianpressWeb", "os": "web", "sv": "7.7.5",
+              "last_time": "", "refresh_type": "1", "rn": "50"}
+    sign = _cls_sign(params)
+    qs = "&".join(f"{k}={params[k]}" for k in sorted(params))
+    resp = requests.get(
+        f"{_CLS_URL}?{qs}&sign={sign}",
+        headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                               "AppleWebKit/537.36",
+                 "Referer": "https://www.cls.cn/"},
+        timeout=10)
+    resp.raise_for_status()
+    payload = resp.json() or {}
+    rows = []
+    for item in (payload.get("data") or {}).get("roll_data") or []:
+        ts = item.get("ctime")
+        if not ts:
+            continue
+        bj = datetime.datetime.fromtimestamp(int(ts), tz=_CLS_TZ)
+        rows.append({
+            "标题": item.get("title") or item.get("brief") or "",
+            "内容": item.get("content") or item.get("brief") or "",
+            "发布日期": bj.date(),
+            "发布时间": bj.time().replace(microsecond=0),
+        })
+    return pd.DataFrame(rows, columns=list(_REQUIRED_COLUMNS["cls"]))
 
 
 def _fetch_em() -> pd.DataFrame:
@@ -85,6 +164,13 @@ def _fetch_em() -> pd.DataFrame:
     import akshare as ak
 
     return ak.stock_info_global_em()
+
+
+def _fetch_sina() -> pd.DataFrame:
+    """拉取新浪财经快讯滚动窗（约 20 条，三备源）。lazy import 同上。"""
+    import akshare as ak
+
+    return ak.stock_info_global_sina()
 
 
 def _alert(message: str) -> bool:
@@ -165,6 +251,11 @@ def _row_to_envelope(source: str, row, fetch_time: str,
         raw_content = _cell(row.get("内容")).strip()
         pub_time = _cls_pub_time(row)
         url = ""
+    elif source == "sina":   # 三备：无标题无链接（_id 走三级 content 替位，同 cls 模式）
+        raw_title = ""
+        raw_content = _cell(row.get("内容")).strip()
+        pub_time = nn.normalize_time(row.get("时间"), source=source)
+        url = ""
     else:  # em
         raw_title = _cell(row.get("标题")).strip()
         raw_content = _cell(row.get("摘要")).strip()
@@ -200,7 +291,9 @@ def _collect_source(source: str, fetch_time: str,
     缺列防御：源改版丢列时显式抛错计失败源——`.get` 逐行取会静默产出空信封，
     全窗坍缩到同一个 `_id`，比失败更糟。窗口条数记日志（回填架构 §4.2 实测值）。
     """
-    df = _fetch_cls() if source == "cls" else _fetch_em()
+    # 经硬超时包装（源挂起 → TimeoutError → 调用方按源失败隔离，健康源继续）；
+    # globals() 晚绑定取 _fetch_{source}：测试 monkeypatch 模块属性仍生效
+    df = _fetch_with_timeout(lambda: globals()[f"_fetch_{source}"]())
     if df is None or len(df) == 0:
         logger.info(f"快讯源 {source} 本轮窗口 0 条")
         return []
@@ -250,14 +343,36 @@ def _archive_source(source: str, envelopes: List[dict]) -> Tuple[int, bool]:
     if new_count == len(envelopes):
         if archived_seen:
             overflowed = True
-            _alert(
-                f"快讯源 {source} 疑似窗口溢出：本轮 {len(envelopes)} 条与已归档零重叠"
-                f"（整窗全新），跳轮/爆量期间中间快讯可能已永久丢失；"
-                f"如频发请加密采集频率（*/15 → */10）"
-            )
+            if _should_alert_overflow(source):
+                sent = _alert(
+                    f"快讯源 {source} 疑似窗口溢出：本轮 {len(envelopes)} 条与已归档零重叠"
+                    f"（整窗全新），跳轮/爆量期间中间快讯可能已永久丢失；"
+                    f"如频发请加密采集频率（*/15 → */10）。同源当日不再重复告警"
+                )
+                if sent:
+                    _mark_overflow_alerted(source)
+            else:
+                logger.info(f"快讯源 {source} 整窗全新（豁免源/今日已告警，静默计溢出）")
         else:
             logger.info(f"快讯源 {source} 整窗全新但历史归档为空（冷启动），不判溢出")
     return new_count, overflowed
+
+
+def _should_alert_overflow(source: str) -> bool:
+    """溢出告警节流：豁免源永不告警（窗口太小溢出是常态，见 _OVERFLOW_ALERT_EXEMPT）；
+    其余每源每自然日最多一次（状态文件跨进程，复用断流监测同一文件）。"""
+    if source in _OVERFLOW_ALERT_EXEMPT:
+        return False
+    state = _read_state()
+    # str() 防御：_today 可能返回 date 对象（测试 fixture 即如此），date 进 JSON 会炸
+    return state.get(source, {}).get("overflow_alert_date") != str(_today())
+
+
+def _mark_overflow_alerted(source: str) -> None:
+    """记录该源今日已发过溢出告警（发送成功才置位，与断流告警同约定）。"""
+    state = _read_state()
+    state.setdefault(source, {})["overflow_alert_date"] = str(_today())
+    _write_state(state)
 
 
 # ---------- 断流持续监测（状态文件跨进程持久） ----------
@@ -310,7 +425,7 @@ def _update_silence_state(window_counts: Dict[str, int],
     无条件复位。状态须落盘：任务每轮跑在新子进程，模块级标志每轮复位。
     """
     state = _read_state()
-    for source in _SOURCES:
+    for source in _active_sources():
         entry = state.get(source)
         if not isinstance(entry, dict):
             entry = {}   # 单源条目形状异常同样重置（"损坏即重置"契约的条目级兜底）
@@ -349,29 +464,36 @@ def run(run_date: str | None = None, **kwargs) -> str:
     fetch_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # 逐源采集+信封化（源级隔离：单源异常不抛，记失败源继续）
+    sources = _active_sources()
     envelopes_by_source: Dict[str, List[dict]] = {}
     failed_sources: List[str] = []
     errors: List[str] = []
-    for source in _SOURCES:
+    for source in sources:
         try:
             envelopes_by_source[source] = _collect_source(source, fetch_time, name_dict)
         except Exception as exc:
             failed_sources.append(source)
             errors.append(f"{source}: {exc!r}")
             logger.warning(f"快讯源 {source} 采集失败（源级隔离，继续其余源）: {exc!r}")
-    if len(failed_sources) == len(_SOURCES):
-        raise RuntimeError(f"快讯双源全部采集失败: {'; '.join(errors)}")
+    if len(failed_sources) == len(sources):
+        raise RuntimeError(f"快讯全部源采集失败: {'; '.join(errors)}")
 
     # 跨日分组归档 + 溢出检测（每源独立）
+    # 逐源归档隔离（审查 S2）：单源归档失败不阻塞其余源入库（入库与归档解耦，
+    # create-only 幂等，归档缺口 spool/下轮补）。快讯滚动窗不可回补，停摆代价最高。
     new_counts: Dict[str, int] = {}
     overflow_sources: List[str] = []
     for source, envelopes in envelopes_by_source.items():
-        new_counts[source], overflowed = _archive_source(source, envelopes)
+        try:
+            new_counts[source], overflowed = _archive_source(source, envelopes)
+        except Exception as exc:  # noqa: BLE001
+            new_counts[source], overflowed = 0, False
+            logger.warning(f"快讯源 {source} 归档失败（不阻塞入库，spool 待下轮搬回）: {exc!r}")
         if overflowed:
             overflow_sources.append(source)
 
     # 入库写全量（与归档去重无关，幂等由 create-only 409→dup 保证），剥 raw_* 键
-    all_envelopes = [env for source in _SOURCES
+    all_envelopes = [env for source in sources
                      for env in envelopes_by_source.get(source, [])]
     ok = dup = 0
     if all_envelopes:
@@ -386,7 +508,7 @@ def run(run_date: str | None = None, **kwargs) -> str:
     _update_silence_state(window_counts, failed_sources)
 
     parts = []
-    for source in _SOURCES:
+    for source in sources:
         if source in failed_sources:
             parts.append(f"{source} 失败")
         else:
@@ -420,7 +542,7 @@ def run_verify(start_date: str, end_date: str, **kwargs) -> str:
     client = osu.get_client()
     replayed = ok_total = dup_total = 0
     failed: List[str] = []   # "source/day"
-    for source in _SOURCES:
+    for source in _active_sources():
         for day in dates:
             try:
                 envelopes = list(news_archive.replay(source, (day, day)))

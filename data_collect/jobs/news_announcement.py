@@ -32,7 +32,9 @@ from data_collect.utils.news_common import cell as _cell
 from data_collect.utils.news_common import flush_spool_safe as _flush_spool_safe
 from data_collect.utils.news_common import fmt_truncated as _fmt_days
 from data_collect.utils.news_common import strip_raw as _strip_raw
+from data_collect.utils.news_common import normalize_date8 as _normalize_date8
 from data_collect.utils.news_common import today as _today
+from data_collect.utils import source_registry
 from data_collect.utils.news_common import verify_dates as _verify_dates
 from data_collect.utils.notify import send_dingtalk
 
@@ -69,7 +71,7 @@ def _record_to_envelope(rec: dict, fetch_time: str) -> dict | None:
         "title": title,
         "content": title,
         "raw_title": raw_title,
-        "raw_content": json.dumps(rec, ensure_ascii=False, sort_keys=True),
+        "raw_content": json.dumps(rec, ensure_ascii=False, sort_keys=True, default=str),
         "pub_time": pub_time or fetch_time,
         "fetch_time": fetch_time,
         "source": _SOURCE,
@@ -151,14 +153,14 @@ def run(run_date: str | None = None, **kwargs) -> str:
     单源无双活：fetch page1 失败经 _collect_day 上抛 → 框架 retry + 钉钉；
     次日早晨少量补发由 run_verify 自然日回溯补齐。
     """
+    if not source_registry.is_enabled(_SOURCE):   # 注册表 kill-switch（二期）
+        return f"公告: 源 {_SOURCE} 已在注册表禁用（enabled=false），跳过"
     if run_date is None or not str(run_date).strip():
         date8 = _today().strftime("%Y%m%d")
     else:
-        # 归一化：run_job.py --date 明示支持 YYYYMMDD 或 YYYY-MM-DD；不归一化则
-        # 切片拼出垃圾 seDate → 巨潮返回 0 条 → 任务静默"成功"，比报错更糟
-        date8 = str(run_date).strip().replace("-", "")
-        if len(date8) != 8 or not date8.isdigit():
-            raise ValueError(f"run_date 需为 YYYYMMDD 或 YYYY-MM-DD，收到: {run_date!r}")
+        # 归一化 YYYY-MM-DD → YYYYMMDD（不归一化则切片拼出垃圾 seDate → 巨潮返回
+        # 0 条 → 任务静默"成功"，比报错更糟）；统一走 news_common（审查 S1）
+        date8 = _normalize_date8(run_date)
 
     _flush_spool_safe()
 

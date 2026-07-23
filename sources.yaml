@@ -1,0 +1,345 @@
+# 数据源注册表：采集型源的单一事实来源（spec docs/superpowers/specs/2026-07-08-source-registry-design.md）
+# - id 即归档目录名，不可变（改名=换存档，视为新源）
+# - 改动流程：编辑 → python manage_sources.py validate → git 提交 → 目标机 pull
+#   → 下一轮调度自动生效（子进程每轮重读，无需重启）
+# - 新源上线：先 python manage_sources.py test <id> 冒烟，再置 enabled: true
+version: 1
+
+defaults:
+  enabled: true
+
+sources:
+  # ================= news_policy（每小时 news_hourly）=================
+  - id: govcn_policy
+    adapter: rss
+    channel: policy
+    job: news_policy
+    url: https://www.gov.cn/pushinfo/v150203/rss.xml
+    headers: browser
+    note: 中国政府网-最新政策
+  - id: govcn_gwy
+    adapter: rss
+    channel: policy
+    job: news_policy
+    url: https://www.gov.cn/guowuyuan/rss.xml
+    headers: browser
+    note: 中国政府网-国务院
+  - id: stats
+    adapter: rss
+    channel: policy
+    job: news_policy
+    url: https://www.stats.gov.cn/sj/zxfb/rss.xml
+    headers: browser
+    enabled: false   # 2026-07-16 起源头挂死（60s 超时，每小时告警刷屏）；恢复后
+                     # `manage_sources.py test stats` 冒烟通过再打开（2026-07-23 停）
+    note: 国家统计局-最新发布
+
+  # ================= news_us（每日 05:30，全部经 us 代理）=================
+  - id: fed
+    adapter: rss
+    channel: us_policy
+    job: news_us
+    url: https://www.federalreserve.gov/feeds/press_all.xml
+    proxy: us
+    headers: browser
+    note: 美联储新闻稿/FOMC
+  - id: sec_8k
+    adapter: rss
+    channel: us_filing
+    job: news_us
+    url: "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&company=&dateb=&owner=include&count=400&output=atom"
+    proxy: us
+    headers: sec_declared
+    note: SEC EDGAR 8-K 滚动窗（声明式 UA，勿改浏览器 UA）
+  - id: nyt_business
+    adapter: rss
+    channel: us_news
+    job: news_us
+    url: https://rss.nytimes.com/services/xml/rss/nyt/Business.xml
+    proxy: us
+    headers: browser
+    note: 纽约时报商业（摘要丰富）
+  - id: nyt_economy
+    adapter: rss
+    channel: us_news
+    job: news_us
+    url: https://rss.nytimes.com/services/xml/rss/nyt/Economy.xml
+    proxy: us
+    headers: browser
+    note: 纽约时报经济
+  - id: wsj_markets
+    adapter: rss
+    channel: us_news
+    job: news_us
+    url: https://feeds.a.dj.com/rss/RSSMarketsMain.xml
+    proxy: us
+    headers: browser
+    note: 华尔街日报市场（付费墙只给标题）
+  - id: wsj_business
+    adapter: rss
+    channel: us_news
+    job: news_us
+    url: https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml
+    proxy: us
+    headers: browser
+    note: 华尔街日报商业
+  - id: wsj_world
+    adapter: rss
+    channel: us_news
+    job: news_us
+    url: https://feeds.a.dj.com/rss/RSSWorldNews.xml
+    proxy: us
+    headers: browser
+    note: 华尔街日报世界
+  - id: bloomberg_markets
+    adapter: rss
+    channel: us_news
+    job: news_us
+    url: https://feeds.bloomberg.com/markets/news.rss
+    proxy: us
+    headers: browser
+    note: 彭博市场（标题）
+  - id: guardian_business
+    adapter: rss
+    channel: us_news
+    job: news_us
+    url: https://www.theguardian.com/business/rss
+    proxy: us
+    headers: browser
+    note: 卫报商业（RSS 直出全文）
+  - id: marketwatch
+    adapter: rss
+    channel: us_news
+    job: news_us
+    url: https://feeds.content.dowjones.io/public/rss/mw_topstories
+    proxy: us
+    headers: browser
+    note: MarketWatch 头条（摘要）
+
+  # ====== 国际权威媒体候选（finance-news-hub 引入；逐源 test 冒烟后启用）======
+  - id: bbc_world
+    adapter: rss
+    channel: intl_news
+    job: news_us
+    url: https://feeds.bbci.co.uk/news/world/rss.xml
+    proxy: us
+    headers: browser
+    enabled: false
+    note: BBC 国际（候选，test 通过后启用）
+  - id: bbc_business
+    adapter: rss
+    channel: intl_news
+    job: news_us
+    url: https://feeds.bbci.co.uk/news/business/rss.xml
+    proxy: us
+    headers: browser
+    enabled: false
+    note: BBC 财经（候选）
+  - id: bbc_tech
+    adapter: rss
+    channel: intl_news
+    job: news_us
+    url: https://feeds.bbci.co.uk/news/technology/rss.xml
+    proxy: us
+    headers: browser
+    enabled: false
+    note: BBC 科技（候选）
+  - id: npr_news
+    adapter: rss
+    channel: intl_news
+    job: news_us
+    url: https://feeds.npr.org/1001/rss.xml
+    proxy: us
+    headers: browser
+    enabled: false
+    note: NPR 美国视角（候选）
+  - id: aljazeera
+    adapter: rss
+    channel: intl_news
+    job: news_us
+    url: https://www.aljazeera.com/xml/rss/all.xml
+    proxy: us
+    headers: browser
+    enabled: false
+    note: 半岛电视台全球南方视角（候选）
+
+  # ================= news_regulator：rsshub 类（每小时）=================
+  - id: ndrc
+    adapter: rsshub
+    channel: policy
+    job: news_regulator
+    route: /gov/ndrc/xwdt
+    note: 发改委新闻发布
+  - id: gov_bmwj
+    adapter: rsshub
+    channel: policy
+    job: news_regulator
+    route: /gov/zhengce/zhengceku/bmwj
+    note: 政策文件库-部委文件
+  - id: cls_red
+    adapter: rsshub
+    channel: flash
+    job: news_regulator
+    route: /cls/telegraph/red
+    note: 财联社加红电报（cls 官方接口挂死期间的复活通道）
+  - id: gelonghui
+    adapter: rsshub
+    channel: flash
+    job: news_regulator
+    route: /gelonghui/live
+    note: 格隆汇快讯
+  - id: cls_depth
+    adapter: rsshub
+    channel: media
+    job: news_regulator
+    route: /cls/depth/1000
+    note: 财联社深度头条
+  - id: caixin
+    adapter: rsshub
+    channel: media
+    job: news_regulator
+    route: /caixin/latest
+    note: 财新最新
+  - id: thepaper
+    adapter: rsshub
+    channel: media
+    job: news_regulator
+    route: /thepaper/featured
+    note: 澎湃首页
+  - id: guancha
+    adapter: rsshub
+    channel: media
+    job: news_regulator
+    route: /guancha/headline
+    note: 观察者网头条
+  - id: ckxx
+    adapter: rsshub
+    channel: media
+    job: news_regulator
+    route: /cankaoxiaoxi/column/zhongguo
+    note: 参考消息-中国
+  - id: cctv_world
+    adapter: rsshub
+    channel: media
+    job: news_regulator
+    route: /cctv/world
+    note: 央视国际(补国际盲区)
+  - id: em_report_strategy
+    adapter: rsshub
+    channel: report
+    job: news_regulator
+    route: /eastmoney/report/strategyreport
+    note: 东财策略研报
+  - id: em_report_industry
+    adapter: rsshub
+    channel: report
+    job: news_regulator
+    route: /eastmoney/report/industry
+    note: 东财行业研报
+  - id: em_report_macro
+    adapter: rsshub
+    channel: report
+    job: news_regulator
+    route: /eastmoney/report/macresearch
+    note: 东财宏观研报
+  - id: em_report_stock
+    adapter: rsshub
+    channel: report
+    job: news_regulator
+    route: /eastmoney/report/stock
+    note: 东财个股研报
+  - id: wallstreetcn_news
+    adapter: rsshub
+    channel: media
+    job: news_regulator
+    route: /wallstreetcn/news/global
+    note: 华尔街见闻资讯
+  - id: wallstreetcn_live
+    adapter: rsshub
+    channel: media
+    job: news_regulator
+    route: /wallstreetcn/live/global
+    note: 华尔街见闻快讯
+  - id: yicai
+    adapter: rsshub
+    channel: media
+    job: news_regulator
+    route: /yicai/headline
+    note: 第一财经头条
+  - id: jiemian
+    adapter: rsshub
+    channel: media
+    job: news_regulator
+    route: /jiemian/lists/1
+    note: 界面要闻
+  - id: kr36_flash
+    adapter: rsshub
+    channel: media
+    job: news_regulator
+    route: /36kr/newsflashes
+    note: 36氪快讯
+  - id: kr36_hot
+    adapter: rsshub
+    channel: media
+    job: news_regulator
+    route: /36kr/hot-list
+    note: 36氪热榜
+  - id: latepost
+    adapter: rsshub
+    channel: media
+    job: news_regulator
+    route: /latepost
+    note: 晚点
+  - id: huxiu
+    adapter: rsshub
+    channel: media
+    job: news_regulator
+    route: /huxiu/article
+    note: 虎嗅
+  - id: szse_notice
+    adapter: rsshub
+    channel: policy
+    job: news_regulator
+    route: /szse/notice
+    note: 深交所公告
+
+  # ====== news_regulator：listpage 类（个性解析在代码 _LISTPAGES，此处登记开关）======
+  - id: csrc
+    adapter: listpage
+    channel: policy
+    job: news_regulator
+    note: 证监会列表页；WAF 敏感 pace 2s（超时/pace 在代码常量，二期适配器化再配置化）
+  - id: mof
+    adapter: listpage
+    channel: policy
+    job: news_regulator
+    note: 财政部-财政新闻
+  - id: people
+    adapter: listpage
+    channel: media
+    job: news_regulator
+    note: 人民网财经
+
+  # ====== 单源 job（二期登记）：采集逻辑在代码，注册表提供 enabled kill-switch ======
+  # adapter=akshare/api 的源不由注册表驱动拉取（列映射/API 分页在代码），仅登记
+  # 元信息 + enabled 开关：置 false 则对应 job 的 run() no-op 跳过（见各 job）。
+  - id: cctv
+    adapter: akshare
+    channel: cctv
+    job: news_cctv
+    note: 新闻联播文字稿（akshare news_cctv 主 + 官网直抓备源，逻辑在 news_cctv.py）
+  - id: cninfo
+    adapter: api
+    channel: announcement
+    job: news_announcement
+    note: 公司公告（巨潮官方 API，逻辑在 utils/cninfo.py + news_announcement.py）
+  - id: em_stock
+    adapter: akshare
+    channel: stock
+    job: news_stock
+    note: 个股新闻（东财 stock_news_em 全市场逐票，逻辑在 news_stock.py）
+
+  # ====== news_flash（快讯）不进注册表 ======
+  # flash 由 config.yaml 的 news.flash_sources 自治（cls/em/sina 零代码换源，cls
+  # 事故已验证），且溢出检测/断流状态机与源列表深耦合。二期评估结论：保持现状，
+  # 不并入注册表——flash_sources 即 flash 的专属 mini-registry（见 spec §N5/二期决策）。

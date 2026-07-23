@@ -7,7 +7,7 @@ database:
 
 dingtalk:
   webhook_token: "your_token_here"
-  message_prefix: "白白胖胖说"
+  message_prefix: "XXXX"
 
 export:
   enable_csv: false
@@ -33,10 +33,15 @@ opensearch:
   password: "your_password"
 
 news:
-  archive_base: "Z:\\A股冷数据\\news"     # 原始归档层（其下 raw/ 等子目录）
+  archive_base: "Z:\\A股冷数据\\news"     # 原始归档层（Windows 盘符路径）
+  archive_base_posix: "/mnt/media/A股冷数据/news"  # Linux 用此（SMB/NAS 挂载点）——平台自动选
   # spool_dir: "D:\\path\\to\\news_spool"  # 可选，NAS 故障时本地暂存目录（缺省 <项目根>/news_spool）
   verify_days_back: 3                    # verify 自然日回溯天数
+  # flash_sources: [cls, em]             # 快讯生效源（可用 cls/em/sina；某源挂死时切换，零代码）
+  # rsshub_base: "http://192.168.9.10:1200"  # 自建 RSSHub（news_regulator 的 rsshub 类源；不配则该类源计失败）
+  # us_proxy: "http://127.0.0.1:7890"        # 美国源专用代理（仅 news_us 显式使用，其他 job 不碰）
   embedding:
+    enabled: true                        # false=向量延迟(news_embed 空转,vec_status 留 pending 省储存),日后改 true 补算
     backend: "local"                     # local(sentence-transformers) | ollama
     model: "BAAI/bge-m3"                 # local=HF 名；ollama 时用 Ollama 模型名（如 "bge-m3"）
     device: "cpu"
@@ -226,12 +231,16 @@ pipelines:
     tasks:
       - {name: news_flash, job: data_collect.jobs.news_flash, timeout: 240, retries: 1}
 
-  # 新闻小时级 :37 错峰——个股全文 → 公告PDF → 补向量（串行避免带宽争抢）
+  # 新闻小时级 :37 错峰——政策RSS → 个股全文 → 公告PDF → 补向量（串行避免带宽争抢）
   news_hourly:
     schedule: {minute: 37, timezone: "Asia/Shanghai"}
     notify: on_failure
     tasks:
-      - {name: news_fulltext, job: data_collect.jobs.news_fulltext, timeout: 1800, retries: 1}
+      - {name: news_policy, job: data_collect.jobs.news_policy, timeout: 300, retries: 1}
+      - {name: news_regulator, job: data_collect.jobs.news_regulator, timeout: 600,
+         retries: 1, depends_on: [news_policy]}
+      - {name: news_fulltext, job: data_collect.jobs.news_fulltext, timeout: 1800,
+         retries: 1, depends_on: [news_regulator]}
       - {name: news_announce_pdf, job: data_collect.jobs.news_announce_pdf, timeout: 1800,
          retries: 1, depends_on: [news_fulltext]}
       - {name: news_embed, job: data_collect.jobs.news_embed, timeout: 900, retries: 1,
@@ -252,6 +261,11 @@ pipelines:
          timeout: 600, retries: 1}
       - {name: news_announcement_verify, job: data_collect.jobs.news_announcement,
          fn: run_verify, timeout: 600, retries: 0, depends_on: [news_announcement]}
+      # 政策/宏观 + 监管/部委/官媒 归档重放补库（自然日窗口，同快讯 verify 语义）
+      - {name: news_policy_verify, job: data_collect.jobs.news_policy,
+         fn: run_verify, timeout: 300, retries: 0}
+      - {name: news_regulator_verify, job: data_collect.jobs.news_regulator,
+         fn: run_verify, timeout: 600, retries: 0}
       # 只读别名快照、必达（不依赖 verify 产出）；不设 depends_on 以免 verify raise 时被跳过；
       # input-order 使其仍排在 news_daily 末位运行（计数新鲜）
       - {name: news_report, job: data_collect.jobs.news_report,
@@ -264,3 +278,12 @@ pipelines:
       - {name: news_stock, job: data_collect.jobs.news_stock, timeout: 7200, retries: 1}
       - {name: news_stock_verify, job: data_collect.jobs.news_stock, fn: run_verify,
          timeout: 900, retries: 0, depends_on: [news_stock]}
+
+  # 美国政策/公司文件 每日 05:30（美股收盘+美东下午披露高峰后；需代理环境）
+  news_us:
+    schedule: {hour: 5, minute: 30, timezone: "Asia/Shanghai"}
+    notify: on_failure
+    tasks:
+      - {name: news_us, job: data_collect.jobs.news_us, timeout: 300, retries: 1}
+      - {name: news_us_verify, job: data_collect.jobs.news_us, fn: run_verify,
+         timeout: 300, retries: 0, depends_on: [news_us]}

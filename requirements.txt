@@ -16,3 +16,4 @@ akshare
 curl_cffi
 trafilatura
 pymupdf
+feedparser

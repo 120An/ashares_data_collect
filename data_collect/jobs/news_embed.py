@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Tuple
 
+from data_collect.config import get_news_config
 from data_collect.utils import embedding
 from data_collect.utils import notify
 from data_collect.utils import opensearch_utils as osu
@@ -113,6 +114,12 @@ def run(run_date: str | None = None, **kwargs) -> str:
     本轮快照之后新增的 pending 不写回、留待下轮（显式 `_id` 协议，见模块 docstring）；
     编码/写回异常上抛（写回前抛则全量留 pending，重试幂等无重复向量风险）。
     """
+    # 向量延迟开关（config news.embedding.enabled，缺省 true）：置 false 则本 job
+    # 立即空转——文档 vec_status 停在 pending（有意留存，非积压），日后需要向量时
+    # 改回 true 跑 news_embed 一轮即全量补算。省储存（向量 ≈5KB/条，占短文档大头）。
+    if not (get_news_config().get("embedding") or {}).get("enabled", True):
+        return "补向量: 向量已禁用（news.embedding.enabled=false，vec_status 留待日后补算）"
+
     client = osu.get_client()
     snapshot = _snapshot_pending(client)
     if not snapshot:

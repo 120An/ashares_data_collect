@@ -1,4 +1,4 @@
-# data_collect — 自动化金融数据采集平台
+﻿# data_collect — 自动化金融数据采集平台
 
 > 一个**可调度、可扩展、可自愈**的金融数据采集底座。当前覆盖 A 股全维度数据（行情 / 财务 / Tick / 板块 / 指数），
 > 以同一套 DAG 编排 + 定时调度框架，向爬虫、新闻公告、非结构化数据、向量数据库持续生长。
@@ -24,7 +24,7 @@ Parquet 冷存。目标是做一个**领域无关**的自动化数据中枢 —�
 - ⏰ **多 pipeline 多 cron**：每日主流水线 + 周末校验 + 月度财务，一次注册全部
 - 🖥️ **跨平台**：Windows / Linux 双平台（xtquant 任务限 Windows，平台不匹配自动跳过）
 - 📣 **可观测**：关键节点钉钉通知（含失败任务错误首行）
-- 📚 **附带 QMT 知识库**：`.claude/skills/qmt-xtquant` 内置 xtdata/xttrader API 参考
+- 📚 **附带 QMT 知识库**：`skills/qmt-xtquant` 内置 xtdata/xttrader API 参考
 
 ## 🗂️ 数据覆盖
 
@@ -33,10 +33,16 @@ Parquet 冷存。目标是做一个**领域无关**的自动化数据中枢 —�
 | A股日线 / 分钟 K 线 | 每日 | PostgreSQL |
 | Tick 分笔 | 每日 | Parquet（按日打包冷存）|
 | 复权因子 | 每日 | PostgreSQL |
-| ETF 日线 / 分钟 / 复权因子（不复权，裸6位码）| 每日 | PostgreSQL（分钟入既有分区表 `etf_minute`）|
+| ETF 日线 / 分钟 / 复权因子（不复权，裸6位码，QMT）| 每日 | PostgreSQL（分钟入既有分区表 `etf_minute`）|
+| ETF 净值 / 基金信息（akshare，跨平台免QMT）| 每日 | PostgreSQL（`etf_nav` / `etf_info`+changelog）|
+| 指数日线 / 分钟 K 线（不复权，代码带点，QMT）| 每日 | PostgreSQL（`index_daily` 全量 + `index_minute` 月分区前向积累）|
+| 打板层：涨停/炸板/跌停/昨涨停四池 + 涨停原因题材（东财+同花顺）| 每日 17:30 | PostgreSQL（`limit_pool` / `limit_up_reason`，按日替换快照）|
+| ETF 期权全链：T型报价 + 希腊字母 + IV（新浪，4标的 ~540合约/日）| 每日 17:30 | PostgreSQL（`etf_option_daily`，前向积累）|
+| 筹码层：融资融券 / 大宗交易 / 个股资金流日级（东财按日全市场）| 每日 17:30 | PostgreSQL（`margin_daily` / `block_trade` / `fund_flow_daily`）|
 | 财务数据（资产负债 / 利润 / 现金流 / 指标 / 股本 / 股东 等 8 表）| 每月 | PostgreSQL |
 | 合约详情 / 板块分类 / 指数权重 | 每日 | PostgreSQL（快照 + 变更记录）|
 | wave3 三浪选股 | 每日 | PostgreSQL |
+| **新闻资讯 8 通道**（快讯/联播/政策/监管官媒/公告/个股/美国/研报）| 15分钟~每日 | OpenSearch（`news-{year}`）+ NAS 归档（详见[新闻子系统](#-新闻资讯子系统)）|
 
 ## 🏗️ 架构
 
@@ -89,6 +95,9 @@ python run_job.py --mode pipeline --task a_share_instrument
 python run_job.py --mode pipeline --task a_share_sector
 python run_job.py --mode pipeline --task a_share_index_weight
 python run_job.py --mode backfill --task a_share_tick --start 20260101 --end 20260408
+# 指数日线全量 / 扩展层（打板/两融/大宗/资金流）回补——详见「指数表」「扩展数据层表」章节
+python run_job.py --mode backfill --task index_daily --start 19900101 --end 20260722
+python run_job.py --mode backfill --task a_share_margin --start 20100331 --end 20260722
 
 # 查漏补缺（检查日期范围内数据完整性，自动补缺）
 python run_job.py --mode verify --task a_share_daily --start 20260401 --end 20260409
@@ -128,19 +137,22 @@ python tools/clean_qmt_cache.py             # 实际清理
 
 `config.yaml` 中可定义多个 pipeline，每个 pipeline 有独立 cron 调度。启动 scheduler 时一次注册全部。
 
-### 当前 8 个 pipeline
+### 当前 12 个 pipeline
 
 | Pipeline | Cron | 任务 | 用途 |
 |----------|------|------|------|
-| `daily` | 每天 15:30 | a_share_daily → wave3, a_share_minute → divid_factors → instrument → sector → index_weight → tick | 主流水线 |
+| `daily` | 每天 15:30 | …→ tick → ETF 链（daily/minute/复权/info/nav）→ index_daily → index_minute | 主流水线 |
 | `weekly_tick_verify` | 周六 08:00 | a_share_tick.run_verify(过去5个交易日) | tick 补漏 |
-| `weekly_kline_verify` | 周日 08:00 | a_share_daily.run_verify + a_share_minute.run_verify(各过去10个交易日) | K线补漏 |
+| `weekly_kline_verify` | 周日 08:00 | a_share_daily + a_share_minute + ETF + 指数 各 run_verify（过去 5~10 交易日） | K线补漏 |
+| `daily_ext` | 每天 17:30 | limit_pool → etf_option → block_trade → margin(T-1) → fund_flow | 打板/期权/筹码（纯HTTP免QMT，东财串行防封）|
+| `weekly_ext_verify` | 周六 09:00 | limit_pool + margin + block_trade + fund_flow 各 run_verify | 扩展数据补漏 |
 | `monthly_financial` | 每月最后一天 23:00 | a_share_financial | 财务月度更新 |
 | `monthly_qmt_clean` | 每月1号 23:00 | clean_qmt_cache | 清理 QMT datadir 本地缓存，回收磁盘 |
-| `news_flash` | 每 15 分钟 | news_flash（快讯双活采集） | 新闻快讯（成功静默） |
-| `news_hourly` | 每小时 :37 | news_fulltext → news_announce_pdf → news_embed | 个股全文+公告PDF+补向量 |
+| `news_flash` | 每 15 分钟 | news_flash（快讯三备：cls直连v1+em+sina） | 新闻快讯（成功静默） |
+| `news_hourly` | 每小时 :37 | news_policy → news_regulator → news_fulltext → news_announce_pdf → news_embed | 政策RSS+个股全文+公告PDF+补向量 |
 | `news_daily` | 每天 20:40 | news_cctv → news_cctv_verify, news_flash_verify, news_announcement → news_announcement_verify → news_report | 联播采集+verify+日报 |
 | `news_stock` | 每天 22:00 | news_stock → news_stock_verify | 全市场个股新闻采集+verify |
+| `news_us` | 每天 05:30 | news_us → news_us_verify | 美国 Fed+SEC（需代理） |
 
 scheduler 启动时会以 ASCII 图打印每个 pipeline 的 DAG 编排（基于 phart+networkx）。新闻系
 pipeline 不带 `platform`（不依赖 xtquant，Windows/Linux 均可运行），详见 [新闻资讯子系统](#-新闻资讯子系统)。
@@ -178,16 +190,20 @@ data_collect/              # 主包
 ├── config.py              # YAML配置加载
 ├── pipeline.py            # DAG任务编排（拓扑排序、平台过滤、失败跳过下游）
 ├── utils/                 # 公共工具
-│   ├── db.py              # PostgreSQL操作
+│   ├── db.py              # PostgreSQL操作（含 replace_day_then_insert 快照按日替换）
 │   ├── notify.py          # 钉钉通知
-│   ├── xtquant_utils.py   # xtquant公共工具（股票列表、批量下载等）
+│   ├── xtquant_utils.py   # xtquant公共工具（股票/ETF/指数代码集、批量下载）
+│   ├── eastmoney.py       # 东财统一入口（em_get 节流防封 + datacenter/clist 翻页 + beijing_now）
+│   ├── etf_utils.py       # ETF 代码工具（裸码/市场推导）
+│   ├── akshare_utils.py   # akshare 懒加载（ETF 净值/信息）
 │   ├── date_utils.py      # 交易日工具
 │   ├── df_utils.py        # DataFrame对齐
 │   ├── export.py          # CSV导出
 │   ├── indicators.py      # 通达信指标函数
 │   ├── progress.py        # 双进度条
-│   └── retry.py           # 重试策略
-└── jobs/                  # 采集任务（每个实现 run() 接口）
+│   ├── retry.py           # 重试策略
+│   └── （新闻系工具见新闻子系统章节：opensearch/archive/normalize/search/…）
+└── jobs/                  # 采集任务（每个实现 run() 接口，可选 run_backfill/run_verify）
     ├── a_share_minute.py  # A股分钟K线 → PostgreSQL
     ├── a_share_daily.py   # A股日线K线 → PostgreSQL
     ├── a_share_financial.py # A股财务数据(8张表) → PostgreSQL
@@ -195,17 +211,30 @@ data_collect/              # 主包
     ├── a_share_instrument.py # 合约详情（快照+变更记录）
     ├── a_share_sector.py  # 板块/行业分类（快照+变更记录）
     ├── a_share_tick.py    # A股Tick → 按日打包 Parquet+zstd 冷存储（read_tick 读取）
+    ├── etf_daily.py / etf_minute.py / etf_divid_factors.py / etf_info.py / etf_nav.py  # ETF 五件套
+    ├── index_daily.py     # 指数日线（全历史 backfill，代码带点）
+    ├── index_minute.py    # 指数分钟线（月分区前向积累，无历史回补）
+    ├── a_share_limit_pool.py # 打板层：东财四池+ths涨停揭秘（按日替换快照）
+    ├── etf_option_daily.py  # ETF期权日快照（T型+希腊字母+IV，新浪批量）
+    ├── a_share_margin.py    # 融资融券明细（东财按日全市场）
+    ├── a_share_block_trade.py # 大宗交易（东财按日，uk 幂等）
+    ├── a_share_fund_flow.py # 个股资金流日级（clist 快照 + 120日窗回补）
     ├── divid_factors.py   # 复权因子 → PostgreSQL
     ├── wave3.py           # 3浪3选股 → wave3_stocks表 + 钉钉/邮件通知
-    └── clean_qmt_cache.py # 清理 QMT datadir 本地缓存（月度，回收磁盘）
+    ├── clean_qmt_cache.py # 清理 QMT datadir 本地缓存（月度，回收磁盘）
+    └── news_*.py          # 新闻系 13 个 job（见新闻子系统章节）
 
-run_job.py                 # CLI入口
+run_job.py                 # 行情 CLI 入口（scheduler/pipeline/backfill/verify）
+run_news.py                # 新闻系独立入口（只认 news_* 管线）
+manage_sources.py          # 数据源注册表 CLI（validate/list/单源冒烟）
 config.yaml                # 配置文件（不入git）
-sql/                       # 建表SQL
+sources.yaml               # 数据源注册表（feed 源单一事实来源 + kill-switch）
+sql/                       # 建表SQL（001~011）
 tests/                     # pytest测试
 tools/                     # 一次性脚本（如 tick 每股→按日打包迁移）
 notebooks/                 # 读测试/探索 notebook
-.claude/skills/            # qmt-xtquant：QMT/xtquant API 知识库（供 AI 编码参考）
+output/                    # 运维脚本与日志（backfill_*.ps1 长跑回补 runbook）
+/skills/            # qmt-xtquant / tick-microstructure / news-opensearch 知识库
 ```
 
 ## 数据库表
@@ -284,6 +313,45 @@ python run_job.py --mode backfill --task etf_divid_factors  --start 20100101 --e
 
 # daily_kline 历史补全（幂等补洞，分年段跑）
 python run_job.py --mode backfill --task a_share_daily --start 20100101 --end 20141231
+```
+
+### 指数表 — `index_daily` / `index_minute`
+
+指数与股票/ETF **物理隔离**：`ai_read` 自建两张新表，代码**带点**（`000300.SH`，`index_code` 列，xtquant 原生），字段纯 QMT `open/high/low/close/volume/amount`，**不复权**。范围 = `沪深指数` 板块 596 个有数据指数 + 北证50（剔 `395*` 无数据段），代码集 `get_index_codes()`，依赖 `a_share_sector` 板块缓存。
+
+- **`index_daily`**（日线，不分区）：`PK(index_code, trade_date)`。**全历史 backfill**——起始给统一下限 `19900101`，QMT 按各指数真实起点截断（上证 1990 / 沪深300 2002 / 北证50 2022，空段不产生行）。
+- **`index_minute`**（分钟线，**月分区** `PARTITION BY RANGE(trade_date)`）：`PK(index_code, trade_date, bar_time)`，`bar_time` 北京时间 `TIME`。**只能前向积累**——QMT 对指数 1m 仅保留近端窗口，历史 1m 全返回 0 且拉旧窗口会**无超时挂死**，故 `run_backfill` 直接 raise，历史分钟线不可回补。子分区 `index_minute_YYYY_MM` 由 `ensure_month_partition` 运行时按需创建（首月分区在 `sql/010`）。
+- 入库走**列名对齐**（英文列名与表一致），天然规避 `etf_minute` 那种"英文 df↔中文表退化为位置对齐"的错位坑。
+
+```bash
+# 指数日线全量 backfill（596 指数 × 全历史，单独长跑，建议按年分段）
+python run_job.py --mode backfill --task index_daily --start 19900101 --end 20261231
+# 分钟线无 backfill（前向积累，每日 pipeline 自动采当天）
+```
+
+### 扩展数据层表 — 打板 / 期权 / 筹码（东财/同花顺/新浪直连，免 QMT）
+
+配方源自 [a-stock-data](https://github.com/simonlin1212/a-stock-data) skill（Apache 2.0），改造进本项目 job（显式列映射 + fail-fast + `em_get` 节流防封）。快照类表用**按日替换**写入（先 DELETE 当日再插，盘中误跑自愈）；终值类表插入即幂等。
+
+| 表 | 内容 | PK/幂等 | 写入语义 | 历史边界 |
+|---|---|---|---|---|
+| `limit_pool` | 东财涨停/炸板/跌停/昨涨停四池（封板时间/资金/连板数/炸板次数…） | `(trade_date, pool_type, stock_code)` | 按日替换 | 源仅近窗 ~15 交易日，前向积累 |
+| `limit_up_reason` | 同花顺涨停揭秘：原因题材/板型/封板率/首封时间 | `(trade_date, stock_code)` | 按日替换 | 可回补 ~2025-12 起 |
+| `etf_option_daily` | ETF 期权 T型报价+希腊字母+IV（50/300/科创50/500，~540 合约/日） | `(trade_date, option_code)` | 按日替换 | 实时源无历史，`run_backfill` 抛错 |
+| `margin_daily` | 融资融券明细（T+1 早发布 → run 采 T-1） | `(trade_date, stock_code)` | 插入幂等 | 全历史（2010-03 两融开闸起） |
+| `block_trade` | 大宗交易（成交价量/买卖营业部/溢价率） | 全字段唯一索引 `block_trade_uk` | 插入幂等 | 全历史 |
+| `fund_flow_daily` | 个股资金流日级（主力/超大/大/中/小单净流入+占比） | `(trade_date, stock_code)` | 按日替换 | 当日 clist 快照前向；回补仅 120 交易日窗（超窗抛错） |
+
+- 衍生指标（炸板率/连板梯队/晋级率）**读时自算不入库**（原始池数据在库，口径可变）。
+- 已知服务端坑：cls `rn≤50`、ths `limit≤200`——超限**不报错只静默返回空**，勿调大。
+- 采集调度：`daily_ext` 每日 17:30（东财任务串行防并发风控）+ `weekly_ext_verify` 周六 09:00 补漏。
+
+```bash
+# 扩展层回补（幂等可断点续跑；长跑建议用 output/backfill_ext_layers.ps1 detached 启动）
+python run_job.py --mode backfill --task a_share_margin      --start 20100331 --end 20260722
+python run_job.py --mode backfill --task a_share_block_trade --start 20100101 --end 20260722
+python run_job.py --mode backfill --task a_share_limit_pool  --start 20251201 --end 20260722
+python run_job.py --mode backfill --task a_share_fund_flow   --start 20260202 --end 20260722  # 仅120交易日窗
 ```
 
 ### `fin_balance` — 资产负债表（~160列）
@@ -565,35 +633,65 @@ market_cap 和 list_days 仅存储不参与筛选，供 web 端自行组合过�
 ## 📰 新闻资讯子系统
 
 以 **OpenSearch 为存储与检索核心**的 A 股新闻采集-存储-检索子系统：全文（BM25）+ 向量（kNN）
-混合检索为一等能力，持续积累财经快讯与新闻联播文字稿，支撑 AI 智能体做数据分析与研报生成。
-分层架构：**数据源（AkShare 等社区出口）→ 采集 job → 原始归档层（NAS）→ OpenSearch（物理索引按年
-`news-{year}` + 别名 `news`）→ `search_news()` 消费入口**。
+混合检索为一等能力，支撑 AI 智能体做数据分析与研报生成。**八大通道全线在采**：财经快讯（三备）、
+新闻联播（三重保障）、政策/宏观、监管/部委/官媒（27 源）、公司公告、个股新闻、美国政策文件（Fed/SEC）、
+券商研报。分层架构：**数据源（AkShare / 官方RSS / 自建RSSHub / 列表页自写解析 / 官方API 五路异构）→
+采集 job → 原始归档层（NAS，平台感知路径）→ OpenSearch（物理索引按年 `news-{year}` + 别名 `news`）→
+`search_news()` 消费入口**。生产部署在 Linux 独立入口 `run_news.py`（见下"部署"）。
+policy/us/regulator 的 feed 源集中登记在 **数据源注册表 `sources.yaml`**（见下"数据源注册表"）。
 
 > **完整子系统说明**（采集内容/数据源/数据组织/数据库设计/清洗打标/任务详情/调度/检索/健壮性）见
 > [docs/news-subsystem-guide.md](docs/news-subsystem-guide.md)；架构设计见
 > [docs/superpowers/specs/2026-07-02-news-opensearch-plan.md](docs/superpowers/specs/2026-07-02-news-opensearch-plan.md)。
 
+### 数据源注册表（`sources.yaml`）
+
+采集型 feed 源（policy/us/regulator 的 RSS/RSSHub + listpage 开关）集中登记在仓库根
+`sources.yaml`——**单一事实来源**。两层架构：**适配器归代码**（怎么采：feed 拉取、
+listpage 的 link_re/WAF 门控、akshare 列映射），**源归配置**（采什么、归哪个 job、开不开）。
+`id` 即归档目录名**不可变**（改名=换存档，视为新源）；坏文件降级 last-good 副本 + 钉钉告警。
+
+```bash
+python manage_sources.py validate            # schema 校验（提交前必跑）
+python manage_sources.py list [--job X] [--channel Y] [--disabled]   # 源总览
+python manage_sources.py test <id>           # 单源冒烟：真拉一次，打印条数+首条标题
+```
+
+**新增 RSS/RSSHub 源零代码 SOP**：① 编辑 `sources.yaml` 加一段 → ② `validate` →
+③ `test <id>` 冒烟 → ④ 置 `enabled: true` → ⑤ commit + 目标机 `git pull`，下一轮调度
+自动生效（子进程每轮重读，免重启）。国际候选源（`channel=intl_news`：BBC/NPR/半岛）
+全部 `enabled:false` 起步，冒烟通过才启用。listpage/akshare 的个性解析逻辑仍在代码
+（勿塞进 YAML 造 DSL）。**二期**：cctv/announcement/stock 单源 job 已登记，注册表提供
+`is_enabled` kill-switch（置 false → 该 job no-op 跳过）；flash 保持 `flash_sources`
+自治不并入（溢出/断流状态机与源列表深耦合，flash_sources 即其 mini-registry）。
+
 ### 采集 job 与日报
 
 | Job | 说明 |
 |-----|------|
-| `news_cctv` | 新闻联播文字稿（AkShare `news_cctv`，历史下限 2016-02-03）。run 采当天、backfill 补历史、自然日 verify 补漏，T+2 仍空写空日标记（`channel=marker`）终止重试 |
-| `news_flash` | A股财经快讯**双活**采集（财联社 `stock_info_global_cls` + 东财 `stock_info_global_em`）。源级失败隔离（双活全挂才算失败）、"整窗全新"溢出检测告警、窗口重放 verify |
+| `news_cctv` | 新闻联播文字稿**主备双活**（主源 AkShare `news_cctv` 历史下限 2016-02-03 + 官网 tv.cctv.com 直抓备源，自写解析）。run 采当天、backfill 补历史、自然日 verify 补漏、T+2 空日标记（`channel=marker`）；verify 末尾 **RSSHub 交叉核验**（摘要分条数 vs 库内条数，单向审计告警抓"全天漏采误标空日"） |
+| `news_flash` | A股财经快讯**三备**采集（财联社 `cls`——2026-07 起**直连官方 v1 API+本地签名**（rn≤50），akshare 挂死路径已弃 + 东财 `em` + 新浪 `sina`；生效源 config `flash_sources` 驱动，某源挂死改配置即切换）。源级失败隔离、单源拉取 60s 硬超时、"整窗全新"溢出检测告警（sina 豁免——窗口小溢出为常态；其余源每日最多告警一次）、窗口重放 verify |
+| `news_policy` | 政策/宏观采集（③）：官方 RSS×3（政府网最新政策/国务院常务会议/统计局数据发布，feedparser、**免 RSSHub**，`channel=policy`）+ 东财财经早餐（`channel=media`）。硬超时+源级隔离+guarded 告警+bozo/缺列防御；归档重放 verify |
+| `news_regulator` | 监管/部委/官媒（B 档，**27 源表驱动**）：**rsshub 类**（自建 RSSHub@9.10：发改委/部委文件库/财联社加红/格隆汇/财新/澎湃/观察者/参考消息/央视国际/华尔街见闻/第一财经/界面/36氪/晚点/虎嗅/东财研报×4/深交所公告）+ **listpage 类**（证监会/财政部/人民网 列表页链接正则 + trafilatura 正文，自写解析面最小化）。抓前去重（ids 查询）+ 挑战页门卫（WAF 限流发首页时拒收防垃圾占 `_id`）+ 无 charset 头智能编码（含 curl 兜底路径）+ pub_time 标签优先嗅探；按内容分 `channel=policy/media/report`。归档重放 verify。已知限制：央行/新华网正文 JS 注入不可解析（经政府网/快讯覆盖）；国际源（路透/彭博/FT）RSSHub 路线放弃，走 news_us 官方直连 |
+| `news_us` | 美国政策/公司文件/权威媒体（需 mihomo 代理，仅此 job 走代理）：Fed 官方 press_all RSS（`channel=us_policy`）+ SEC EDGAR 8-K Atom（`channel=us_filing`，声明式 UA）+ **权威媒体 RSS**（`channel=us_news`：纽约时报商业/经济、华尔街日报市场/商业/世界、彭博市场、卫报商业全文、MarketWatch，实测 190 条/轮；付费墙源给标题+摘要，卫报直出全文；路透官方停 RSS 不列）。每日 05:30；bge-m3 中英同向量空间，跨语言语义检索免费获得 |
 | `news_announcement` | 公司公告（巨潮官方 API `hisAnnouncement/query`，`utils/cninfo.py`）。**单查询全市场**深沪京并集元数据、按 `totalpages` 分页、requests→curl_cffi 限频兜底、自然日 verify；`channel=announcement`，Phase 1 元数据（Phase 2 抽 PDF 正文写 `body`） |
 | `news_stock` | 个股新闻：全市场逐票 `stock_news_em`（每票 10 条摘要），**内存聚合 article→stocks[]**（跨票重复 17%）、`channel=stock`、`_id=sha1(url)`、摘要向量走 news_embed；滚动窗归档重放 verify；失败码整轮后重试一次、失败率>5% 告警 |
 | `news_fulltext` | 个股新闻全文抽取（Phase 2）：并发(6)抓 `新闻链接`（requests→curl_cffi）→ trafilatura 抽正文，经共享核心 `bodyfill` 写 `body`+`vec_status=pending`（触发全文重编码）、失败 `body_status=failed`（摘要兜底不重试） |
 | `news_announce_pdf` | 公告 PDF 正文抽取（⑤ Phase 2）：并发(4)下载 PDF（≤20MB/`%PDF` 魔数）→ PyMuPDF 抽文本层，经 `bodyfill` 写 `body`（截断 5 万字）+`pdf_status=done`；扫描版/失败 `failed`（title 兜底不 OCR） |
-| `news_embed` | 小时级补向量：扫 `vec_status=pending` 取显式 `_id` 快照 → 批量 encode（bge-m3）→ 按 `_id` 写回置 `done`。BM25 入库即可搜、向量 ≤1h 补齐；pending 积压告警 |
-| `news_report` | 钉钉日报：当日各 channel 入库数（flash/cctv/marker + 其他）+ pending 补向量积压（总数 + 最老滞留分钟）。索引未建仍发、发送失败不反噬 job |
+| `news_embed` | 小时级补向量：扫 `vec_status=pending` 取显式 `_id` 快照 → 批量 encode（bge-m3）→ 按 `_id` 写回置 `done`。BM25 入库即可搜、向量 ≤1h 补齐；pending 积压告警。**向量延迟开关** `news.embedding.enabled=false`（省储存）→ 本 job 空转、`vec_status` 留 pending，日后改 true 跑一轮即全量补算 |
+| `news_report` | 钉钉日报：当日各 channel 入库数（flash/cctv/marker + 其他）+ pending 补向量积压（总数 + 最老滞留分钟；向量禁用时标"向量已禁用,留待补算"防误读）。索引未建仍发、发送失败不反噬 job |
 
-### 调度（四条 pipeline）
+### 调度（五条 news pipeline，独立入口 `run_news.py`）
 
 | Pipeline | Cron | 任务 | 通知 |
 |----------|------|------|------|
 | `news_flash` | 每 15 分钟 | news_flash | `on_failure`（成功静默，避免刷屏） |
-| `news_hourly` | 每小时 :37 | news_fulltext → news_announce_pdf → news_embed | `on_failure` |
-| `news_daily` | 每天 20:40 | news_cctv → news_cctv_verify, news_flash_verify, news_announcement → news_announcement_verify → news_report | 保留成功汇总 |
+| `news_hourly` | 每小时 :37 | news_policy → news_regulator → news_fulltext → news_announce_pdf → news_embed | `on_failure` |
+| `news_us` | 每日 05:30 | news_us → news_us_verify（Fed+SEC，需 mihomo 代理） | `on_failure` |
+| `news_daily` | 每天 20:40 | news_cctv → cctv_verify, flash_verify, news_announcement → announcement_verify, policy_verify, regulator_verify → news_report | 保留成功汇总 |
 | `news_stock` | 每天 22:00 | news_stock → news_stock_verify | 全市场个股新闻采集+verify |
+
+> **查漏补缺全覆盖**：每通道均有 `run_verify`（自然日回溯归档重放补库）——cctv/flash/announcement/policy/regulator 排在 news_daily，stock 排 news_stock，us 排 news_us。同行情系 QMT 的 verify 机制，但按**自然日**（新闻不休市）。
 
 ### 检索用法 `search_news()`
 
@@ -615,12 +713,17 @@ res = search_news(
 ```
 
 - 四种 mode：`hybrid`（BM25+kNN 归一融合，OpenSearch 原生）、`rrf`（客户端两路 RRF 融合，质量基线/pipeline 未建时替代）、`bm25`（单路，**绝不加载 embedding 模型**，模型不可用时的降级路径）、`knn`（纯向量）。
+- **向量禁用时**（`news.embedding.enabled=false`）：`hybrid`/`knn`/`rrf` 自动降级 `bm25`（全库无 `content_vec`，降级保证消费方总有结果而非静默返回空）；日后补算向量即恢复语义路。
+- `channel` 全集：`flash`/`cctv`/`policy`/`media`/`report`/`announcement`/`stock`/`us_policy`/`us_filing`/`us_news`/`intl_news`（国际权威媒体 BBC/NPR/半岛，候选启用中）/`marker`。
 - 过滤器注入子查询内部（`bool.filter` / `knn.filter`），不用 `post_filter`（会丢 kNN 窗口内相关结果）。
 - 冷启动容错：别名/索引尚未建（404）按空结果返回，不炸消费方。
 
 ### 原始归档层
 
-`Z:\A股冷数据\news\raw\{source}\YYYY\MM\DD.jsonl.gz`（每行一条含 `raw_*` 原文的信封，追加不改写）。
+`{archive_base}/raw/{source}/YYYY/MM/DD.jsonl.gz`（每行一条含 `raw_*` 原文的信封，追加不改写）。
+**归档根平台感知**：Windows 用 `news.archive_base`（盘符如 `Z:\A股冷数据\news`）、Linux 用
+`news.archive_base_posix`（SMB/NAS 挂载点如 `/mnt/media/A股冷数据/news`）——一份 config 两机通用；
+Linux 缺失该项或误填盘符路径**响亮 raise**（防静默写进 CWD 垃圾目录丢失唯一存档）。
 NAS 不可用时同格式降级落本地 **spool 目录** + 钉钉告警，**入库照常**；每轮 job 开头尝试把 spool
 搬回 NAS（按 `_id` 幂等）。快讯窗口不可回补，归档层是其唯一存档，绝不让归档单点阻塞采集。
 
@@ -638,19 +741,44 @@ NAS 不可用时同格式降级落本地 **spool 目录** + 钉钉告警，**入
 4. **周 snapshot 仓库注册**（`path.repo` fs 仓库）：快速恢复通道，归档全量重放是终极兜底。
 5. **删除测试残留索引** `news-2099`（单测/演练可能留下的哑索引）。
 
+### 部署（Linux 生产机，独立于行情）
+
+新闻系统**不依赖 xtquant**，纯 Python（akshare/requests/opensearch-py/feedparser/trafilatura/pymupdf/curl_cffi）
++ 网络（PG/OpenSearch/Ollama），可在 Linux 独立部署，与 Windows 行情机互不干扰。
+
+```bash
+# 1. 拉代码 + 装依赖（一份 config 两机通用：平台感知路径 + us_proxy）
+git clone <repo> && cd data_collect && pip install -r requirements.txt
+
+# 2. 挂载 NAS（SMB）→ archive_base_posix 指向的挂载点；注意 uid 让运行用户可写
+sudo mount -t cifs //192.168.9.12/media /mnt/media \
+  -o credentials=/root/.smbcred,uid=$(whoami),gid=$(whoami),file_mode=0664,dir_mode=0775,vers=3.0
+# 开机自挂：把等价行加进 /etc/fstab（加 _netdev,nofail）
+
+# 3. 美国源代理（可选，news_us 用）：部署 mihomo（Clash.Meta），config 填 news.us_proxy
+#    仅 news_us 显式走代理，其他 job 一律直连（代码级隔离，不设全局环境变量）
+
+# 4. 逐管线自测 → screen 起完整调度
+python run_news.py --mode pipeline --pipeline news_hourly   # 手测最重一条
+screen -S news && python run_news.py                        # 注册全部 5 管线，Ctrl-A D 脱离
+```
+
+- **入口分离**：`run_news.py` 只认 news 管线/任务（scheduler/pipeline/backfill/verify 四模式），传行情名报错；`run_job.py` 反之。单一事实源 `NEWS_PIPELINES`。
+- **补历史/查漏**：`run_news.py --mode backfill --task news_cctv --start ... --end ...`；`--mode verify` 同理。
+
 > **服务器部署**：OpenSearch + Dashboards 3.7.0 从零部署的完整手册（含磁盘/账号/建置/防火墙 + 配置汇总）见
 > [`docs/deploy/opensearch-3.7-server-setup.md`](docs/deploy/opensearch-3.7-server-setup.md)；软件侧一键部署脚本（幂等、密码走环境变量、不碰磁盘）
-> [`docs/deploy/deploy_opensearch.sh`](docs/deploy/deploy_opensearch.sh)。
+> [`docs/deploy/deploy_opensearch.sh`](docs/deploy/deploy_opensearch.sh)。AI 智能体只读接入见 [`docs/deploy/news-reader-account.md`](docs/deploy/news-reader-account.md) + skill `./skills/news-opensearch/`；系统技术文档（面向非 OpenSearch 背景）见 [`docs/news-system-tech-doc.md`](docs/news-system-tech-doc.md)。
 
 ## tick 微观结构分析技能 (tick-microstructure)
 
-位于 `.claude/skills/tick-microstructure/`，是一个**零外部依赖**的 L1 快照 tick 微观结构分析库，
+位于 `./skills/tick-microstructure/`，是一个**零外部依赖**的 L1 快照 tick 微观结构分析库，
 可独立于本项目的数据层使用。覆盖五大维度：资金流向（Lee-Ready / BVC）、盘口压力（OBI / 微价格 / 委比）、
 流动性（有效价差 / Amihud / Roll / Kyle-λ）、竞价行为（开盘集合竞价分析）、执行质量（VWAP / TWAP / 滑点）。
 
 **30秒上手：**
 ```python
-import sys; sys.path.insert(0, ".claude/skills/tick-microstructure")
+import sys; sys.path.insert(0, "./skills/tick-microstructure")
 import tick_analysis as ta
 
 # 方式一：直接读本项目打包的 Parquet（推荐）
@@ -664,18 +792,20 @@ print(result["vwap"])         # 全天成交量加权均价
 ```
 
 **L1 边界说明**：所有指标均为统计近似，无法识别逐笔成交（深交所 Level-2 才有）、真实大单来源或席位信息。
-详见 [SKILL.md](.claude/skills/tick-microstructure/SKILL.md)。
+详见 [SKILL.md](./skills/tick-microstructure/SKILL.md)。
 
 ## 🗺️ 路线图
 
-- ✅ A 股 QMT 采集：日线 / 分钟 / Tick / 财务 / 复权 / 合约 / 板块 / 指数权重
+- ✅ A 股 QMT 采集：日线 / 分钟 / Tick / 财务 / 复权 / 合约 / 板块 / 指数权重 / 指数行情（日线全量 + 分钟前向积累）
+- ✅ 扩展数据层（东财/同花顺/新浪直连 HTTP，免 QMT）：打板四池+涨停题材归因 / ETF期权全链希腊字母+IV / 融资融券 / 大宗交易 / 个股资金流；财联社快讯直连官方 v1 API 复活（本地签名零 key）
+- ✅ ETF 采集：日线 / 分钟（既有分区表）/ 复权因子（QMT）+ 净值 / 基金信息（akshare 跨平台）
 - ✅ DAG 编排 + 定时调度 + 查漏补缺 + Tick 按日打包冷存
 - ✅ 内置 QMT/xtquant API 知识库（AI 编码辅助）
-- ✅ 新闻资讯子系统 MVP：快讯/联播采集 + OpenSearch 混合检索（BM25+kNN）+ 原始归档层
-- 🚧 数据质量监控与告警完善
-- 🚧 新闻扩源：政策/官媒（RSSHub）、公告全文、个股新闻、IK 分词 + reindex 升级
-- 🔮 通用爬虫框架（声明式配置数据源）
-- 🔮 非结构化数据处理流水线
+- ✅ **新闻资讯子系统全量上线**（Linux 生产部署）：八大通道（快讯三备/联播三重保障/政策/监管部委官媒27源/公告+PDF全文/个股+网页全文/美国Fed+SEC/券商研报）+ OpenSearch 混合检索（BM25+kNN，向量可延迟）+ 原始归档层（平台感知+spool降级）+ 全通道查漏补缺 + AI 智能体只读接入
+- ✅ 数据源异构冗余：AkShare / 官方RSS / 自建RSSHub / 列表页自写解析 / 官方API 五路
+- ✅ **数据源注册表 `sources.yaml`**：policy/us/regulator 的 feed 源声明式集中登记（加源零代码）+ cctv/announcement/stock 单源 job 登记（`is_enabled` kill-switch）+ `manage_sources.py` CLI（validate/list/单源冒烟）+ last-good 降级。flash 保持 `flash_sources` 自治不并入（溢出/断流深耦合）
+- 🚧 IK 分词 + reindex 升级；检索质量基线（15-20 查询对比表）
+- 🔮 通用爬虫框架；国际财经英文一手源（付费 API）
 - 🔮 **向量数据库 + RAG**：新闻检索封装为 MCP server，多源数据汇入向量库支撑语义检索与研报生成
 
 ## 🤝 贡献

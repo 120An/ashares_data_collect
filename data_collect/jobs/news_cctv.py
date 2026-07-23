@@ -34,9 +34,13 @@ from data_collect.utils import news_archive
 from data_collect.utils import news_normalize as nn
 from data_collect.utils import opensearch_utils as osu
 from data_collect.utils.news_common import cell as _cell
+from data_collect.utils.news_common import fetch_with_timeout
 from data_collect.utils.news_common import flush_spool_safe as _flush_spool_safe
 from data_collect.utils.news_common import fmt_truncated as _fmt_days
+from data_collect.utils.news_common import normalize_date8 as _normalize_date8
+from data_collect.utils.news_common import strip_raw as _strip_raw
 from data_collect.utils.news_common import today as _today
+from data_collect.utils import source_registry
 from data_collect.utils.news_common import verify_dates as _verify_dates
 from data_collect.utils.notify import send_dingtalk
 
@@ -56,6 +60,168 @@ def _fetch_cctv(date: str) -> pd.DataFrame:
     import akshare as ak
 
     return ak.news_cctv(date=date)
+
+
+# ---------- 官网备源（主备双活，2026-07-08 用户批准：无 Tushare 权限走官网直抓） ----------
+# 备源与主源抓的是同一节目 → 三级 _id（source|pub_time|title）天然一致，两源
+# 交替/重复采集零重复。备源为自写解析（用户授权"无现成工具可自写"），上游是
+# 央视官网多年稳定的按日分条页；解析断裂只影响备源（主源 akshare 不受牵连）。
+
+_FETCH_TIMEOUT_SECONDS = 60        # 主源硬超时（cls 挂起事故铁律：新老源一律必带）
+_OFFICIAL_TIMEOUT_SECONDS = 120    # 备源整体硬超时（~13 分条页 × 0.3s pace 余量足）
+_OFFICIAL_ITEM_PACE = 0.3          # 分条页间限速（礼貌抓取）
+_OFFICIAL_DAY_URL = "https://tv.cctv.com/lm/xwlb/day/{date8}.shtml"
+_OFFICIAL_HEADERS = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                    "Chrome/120.0.0.0 Safari/537.36")}
+_VIDE_LINK_RE = re.compile(r'href="(https?://[^"]+?VIDE[^"]+?\.shtml)"')
+_PAGE_TITLE_RE = re.compile(r"<title>(.*?)</title>", re.S)
+_CONTENT_AREA_RE = re.compile(
+    r'id="content_area"[^>]*>(.*?)(?:</div>\s*</div>|</div>\s*<div)', re.S)
+
+
+def _http_get_text(url: str) -> str:
+    """GET → utf-8 文本；非 200 抛错（lazy import requests；测试打桩点）。"""
+    import requests
+
+    resp = requests.get(url, headers=_OFFICIAL_HEADERS, timeout=30)
+    if resp.status_code != 200:
+        raise RuntimeError(f"cctv 官网 HTTP {resp.status_code}: {url}")
+    resp.encoding = "utf-8"
+    return resp.text
+
+
+def _fetch_cctv_official(date8: str) -> List[Dict[str, str]]:
+    """央视官网直抓某日联播（备源）→ [{"title","content"}, ...]。
+
+    路线（2026-07-08 实测）：按日分条页 day/{date8}.shtml 列出各条 VIDE 链接
+    （首条为完整版，title 含《新闻联播》，跳过）→ 各分条页 <title>（剥 "[视频]"
+    前缀与 "_CCTV..." 站点后缀）+ id="content_area" 正文（剥 HTML 标签）。
+    单条页失败跳过不中断（备源 best-effort）。
+    """
+    day_html = _http_get_text(_OFFICIAL_DAY_URL.format(date8=date8))
+    links = list(dict.fromkeys(_VIDE_LINK_RE.findall(day_html)))
+    rows: List[Dict[str, str]] = []
+    for link in links:
+        try:
+            page = _http_get_text(link)
+        except Exception as exc:  # noqa: BLE001 —— 单条隔离
+            logger.debug(f"cctv 官网分条页失败（跳过）{link}: {exc!r}")
+            time.sleep(_OFFICIAL_ITEM_PACE)
+            continue
+        title_m = _PAGE_TITLE_RE.search(page)
+        raw_title = title_m.group(1).strip() if title_m else ""
+        title = re.sub(r"^\[视频\]", "", re.sub(r"_CCTV.*$", "", raw_title, flags=re.S)).strip()
+        if not title or "《新闻联播》" in title:   # 完整版条目：正文是编辑署名，跳过
+            time.sleep(_OFFICIAL_ITEM_PACE)
+            continue
+        content_m = _CONTENT_AREA_RE.search(page)
+        content = re.sub(r"<[^>]+>", "", content_m.group(1)).strip() if content_m else ""
+        if content:
+            rows.append({"title": title, "content": content})
+        time.sleep(_OFFICIAL_ITEM_PACE)
+    return rows
+
+
+# ---------- RSSHub 交叉核验（用户 2026-07-08 提议；语义=单向审计告警，非取交集） ----------
+# RSSHub 联播路由每 item 为一期，summary 是"本期节目主要内容"编号清单——它是逐条
+# 全量（akshare/官网采集）的**子集**，故核验单向：库内条数 < 摘要条数即确定缺漏
+# （尤其能抓"全天漏采却被误标空日"）。取交集会丢真数据，不做。
+
+_XWLB_ROUTE = "/cctv/tv/lm/xwlb"
+
+
+def _fetch_xwlb_entries() -> list:
+    """拉取 RSSHub 联播路由 entries（lazy import；测试打桩点）。"""
+    import feedparser
+    import requests
+
+    base = str(get_news_config().get("rsshub_base") or "").rstrip("/")
+    if not base:
+        return []
+    resp = requests.get(f"{base}{_XWLB_ROUTE}", timeout=30)
+    if resp.status_code != 200:
+        return []
+    return list(feedparser.parse(resp.content).entries or [])
+
+
+def _rsshub_episode_counts() -> Dict[str, int]:
+    """RSSHub 联播每期摘要 → {date8: 主要内容条数}（同日 19:00/21:00 两版取 max）。
+
+    best-effort：RSSHub 未配置/不可用返回空 dict——核验是审计增强，不是采集依赖。
+    """
+    try:
+        entries = _fetch_xwlb_entries()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"联播 RSSHub 核验源不可用（本轮跳过核验）: {exc!r}")
+        return {}
+    counts: Dict[str, int] = {}
+    for entry in entries or []:
+        m = re.search(r"(20\d{2})/(\d{2})/(\d{2})", str(entry.get("title") or ""))
+        if not m:
+            continue
+        date8 = f"{m.group(1)}{m.group(2)}{m.group(3)}"
+        # 真实 feed 的 summary 是分条 <a> 链接清单（2026-07-08 实测）：每条新闻
+        # 标题带 "[视频]" 前缀，完整版条目（《新闻联播》 yyyymmdd hh:mm）不带
+        # ——数 "[视频]" 即分条数
+        n = str(entry.get("summary") or "").count("[视频]")
+        counts[date8] = max(counts.get(date8, 0), n)
+    # 模板漂移信号：拿到了 entries 但一条都没数出分条（"[视频]"标记变了）→ 核验会
+    # 静默失灵，记 warning 让运维可见（不告警刷屏，仅日志——审计层非采集依赖）
+    if entries and not any(counts.values()):
+        logger.warning("联播 RSSHub 核验：取到 entries 但分条计数全 0，疑 summary "
+                       "模板漂移（'[视频]'标记失效），交叉核验本轮失灵")
+    return counts
+
+
+def _db_day_count(client, date8: str):
+    """该日库内联播条数；查询异常返回 None（跳过该日核验，绝不误报）。"""
+    day = f"{date8[:4]}-{date8[4:6]}-{date8[6:]}"
+    body = {"query": {"bool": {"filter": [
+        {"term": {"channel": "cctv"}},
+        {"range": {"pub_time": {"gte": f"{day} 00:00:00",
+                                "lte": f"{day} 23:59:59"}}}]}},
+        "size": 0, "track_total_hits": True}
+    try:
+        resp = osu.search_raw(client, body)
+        return osu.hits_total(resp)          # 兼容 total 的 dict/legacy-int 两形态
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"联播核验 {date8} 库内计数失败（跳过该日）: {exc!r}")
+        return None
+
+
+def _fetch_day_with_backup(date8: str) -> pd.DataFrame:
+    """主备取数：akshare 主源（异常/空/挂起）→ 官网备源；语义分两种收尾。
+
+    两源均经 fetch_with_timeout 硬超时。失败传播契约（与主源单飞时代一致）：
+    - 主源**正常返回空** + 备源空/失败 → 空 df（空日语义，T+2 标记规则照旧）；
+    - 主源**异常** + 备源也无产出 → **重抛主源异常**（走框架 retry/backfill 失败
+      日记录——备源兜不住时失败必须可见，不能把"错"降级成"空"）。
+    """
+    primary_exc: Exception | None = None
+    try:
+        df = fetch_with_timeout(lambda: _fetch_cctv(date8),
+                                _FETCH_TIMEOUT_SECONDS, "联播主源(akshare)拉取")
+        if df is not None and len(df):
+            return df
+        logger.info(f"联播主源 {date8} 空，尝试官网备源")
+    except Exception as exc:  # noqa: BLE001
+        primary_exc = exc
+        logger.warning(f"联播主源 {date8} 失败（{exc!r}），尝试官网备源")
+
+    try:
+        rows = fetch_with_timeout(lambda: _fetch_cctv_official(date8),
+                                  _OFFICIAL_TIMEOUT_SECONDS, "联播备源(官网)拉取")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"联播备源 {date8} 也失败: {exc!r}")
+        rows = []
+    if rows:
+        logger.info(f"联播备源 {date8} 取得 {len(rows)} 条")
+        return pd.DataFrame([{"date": date8, "title": r["title"],
+                              "content": r["content"]} for r in rows])
+    if primary_exc is not None:
+        raise primary_exc
+    return pd.DataFrame()
 
 
 def _load_name_dict() -> Dict[str, str]:
@@ -95,10 +261,6 @@ def _row_date(value, run_date: str) -> str:
     """
     digits = re.sub(r"\D", "", "" if value is None else str(value))
     return digits[:8] if len(digits) >= 8 else run_date
-
-
-# 信封中只进归档、不进 OpenSearch 的键（见 _collect_day 入库前剥除）
-_RAW_ONLY_KEYS = ("raw_title", "raw_content")
 
 
 def _build_envelopes(df: pd.DataFrame, run_date: str,
@@ -164,7 +326,7 @@ def _collect_day(run_date: str, client=None,
     返回 (源条数, 入库新增, 重复, 归档新增)；源空返回全 0——是否写空日标记由
     调用方按 T+2 规则决定，本函数不管。client/name_dict 可传入复用，缺省即时创建。
     """
-    df = _fetch_cctv(run_date)
+    df = _fetch_day_with_backup(run_date)   # 主备双活：akshare → 官网直抓
     if df is None or len(df) == 0:
         return 0, 0, 0, 0
 
@@ -180,9 +342,9 @@ def _collect_day(run_date: str, client=None,
     if client is None:
         client = osu.get_client()
     # 入库写全量（与归档去重无关，幂等由 create-only 409→dup 保证），但剥除 raw_*：
-    # 索引 mapping 未定义该两键，不剥会被动态 mapping 长出计划外字段（原文只进归档）
-    docs = [{k: v for k, v in env.items() if k not in _RAW_ONLY_KEYS}
-            for env in envelopes]
+    # 索引 mapping 未定义这些键，不剥会被动态 mapping 长出计划外字段（原文只进归档）。
+    # 统一走 news_common.strip_raw（含 time_estimated），杜绝契约分叉（审查 S4）
+    docs = [_strip_raw(env) for env in envelopes]
     ok, dup = osu.bulk_create(client, docs)
     return len(envelopes), ok, dup, archived
 
@@ -259,10 +421,12 @@ def run(run_date: str | None = None, **kwargs) -> str:
 
     当天源返回空时**不写空日标记**（文字稿可能晚点），交 run_verify 按 T+2 判定。
     """
+    if not source_registry.is_enabled("cctv"):   # 注册表 kill-switch（二期）
+        return "联播: 源 cctv 已在注册表禁用（enabled=false），跳过"
     if run_date is None or not str(run_date).strip():
         date8 = _today().strftime("%Y%m%d")
     else:
-        date8 = str(run_date).strip()
+        date8 = _normalize_date8(run_date)   # YYYY-MM-DD → YYYYMMDD，异形响亮报错
 
     _flush_spool_safe()
 
@@ -374,6 +538,23 @@ def run_verify(start_date: str, end_date: str, **kwargs) -> str:
     summary = (f"联播verify [{dates[0]}~{dates[-1]}]: 补采 {refilled} 日, "
                f"已有 {existing} 日, 新标记 {marked} 日, 待定 {pending} 日, "
                f"失败 {len(failed_days)} 日")
+
+    # RSSHub 交叉核验（单向审计：摘要"主要内容"是全量子集，库内更少即确定缺漏）
+    episode_counts = _rsshub_episode_counts()
+    if episode_counts:
+        mismatch: List[str] = []
+        for d in dates:
+            listed = episode_counts.get(d, 0)
+            if listed <= 0:
+                continue
+            have = _db_day_count(client, d)
+            if have is not None and have < listed:
+                mismatch.append(f"{d}(库{have}<摘要{listed})")
+        if mismatch:
+            send_dingtalk(f"联播交叉核验缺漏: {','.join(mismatch)}——"
+                          f"请检查当日采集；若已标空日标记，删除 marker 可恢复重采")
+            summary += f", 核验缺漏[{','.join(mismatch)}]"
+
     if failed_days:
         summary += f"({_fmt_days(failed_days)})"
         raise RuntimeError(summary)   # 窗口已处理完，仍上抛保留框架失败通知语义

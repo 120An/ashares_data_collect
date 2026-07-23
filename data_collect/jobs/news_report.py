@@ -30,10 +30,12 @@ from typing import Dict, Optional, Tuple
 
 from opensearchpy.exceptions import NotFoundError
 
+from data_collect.config import get_news_config
 from data_collect.utils import notify
 from data_collect.utils import opensearch_utils as osu
 from data_collect.utils.news_common import age_minutes as _age_minutes
 from data_collect.utils.news_common import now as _now
+from data_collect.utils.news_common import normalize_date8 as _normalize_date8
 from data_collect.utils.news_common import today as _today
 from data_collect.utils.notify import send_dingtalk
 
@@ -108,15 +110,17 @@ def _channel_segment(counts: Dict[str, int]) -> str:
 
 def _format_summary(day: str, total: int, counts: Dict[str, int],
                     pending: int, oldest_minutes: Optional[int],
-                    index_missing: bool = False) -> str:
+                    index_missing: bool = False, vec_deferred: bool = False) -> str:
     """拼装日报摘要串（发送串 == 返回串，测试锁定）。"""
     if index_missing:
         # 索引未建：各字段 0/None，仍给出完整形状供运维一眼识别
         return (f"新闻日报 {day}: 索引未建 | 总 0 | {_channel_segment({})} | "
                 f"pending 0(最老 - 分钟)")
     minutes = "-" if oldest_minutes is None else str(oldest_minutes)
-    return (f"新闻日报 {day}: 总 {total} | {_channel_segment(counts)} | "
-            f"pending {pending}(最老 {minutes} 分钟)")
+    # 向量禁用时 pending 是有意留存（省储存），标注清楚防误读为积压故障
+    pending_seg = (f"pending {pending}(向量已禁用,留待补算)" if vec_deferred
+                   else f"pending {pending}(最老 {minutes} 分钟)")
+    return f"新闻日报 {day}: 总 {total} | {_channel_segment(counts)} | {pending_seg}"
 
 
 # ======== Pipeline 标准接口 ========
@@ -131,7 +135,7 @@ def run(run_date: str | None = None, **kwargs) -> str:
     if run_date is None or not str(run_date).strip():
         date8 = _today().strftime("%Y%m%d")
     else:
-        date8 = str(run_date).strip()
+        date8 = _normalize_date8(run_date)   # 异形 --date → 畸形 day → 误报索引未建
     day = f"{date8[:4]}-{date8[4:6]}-{date8[6:]}"
 
     client = osu.get_client()
@@ -155,6 +159,8 @@ def run(run_date: str | None = None, **kwargs) -> str:
         return summary
 
     oldest_minutes = _age_minutes(oldest_fetch, _now())
-    summary = _format_summary(day, total, counts, pending, oldest_minutes)
+    vec_deferred = not (get_news_config().get("embedding") or {}).get("enabled", True)
+    summary = _format_summary(day, total, counts, pending, oldest_minutes,
+                              vec_deferred=vec_deferred)
     _guarded_send(summary)
     return summary
