@@ -21,10 +21,10 @@ Parquet 冷存。目标是做一个**领域无关**的自动化数据中枢 —�
 - 🛡️ **生产级稳健**：每个任务独立子进程 + 超时硬杀 + 自动重试，失败跳过下游
 - 🔁 **查漏补缺**：`verify` 模式按天幂等补缺，避免重复下载写入
 - 🧊 **冷热分离**：结构化入 PostgreSQL，Tick 按日打包 Parquet+zstd 冷存（按股读取走谓词下推，不解压整文件）
-- ⏰ **多 pipeline 多 cron**：每日主流水线 + 周末校验 + 月度财务，一次注册全部
+- ⏰ **多 pipeline 多 cron**：每日主流水线 + 盘后扩展采集 + 周末校验 + 月度财务，一次注册全部（当前 12 条）
 - 🖥️ **跨平台**：Windows / Linux 双平台（xtquant 任务限 Windows，平台不匹配自动跳过）
 - 📣 **可观测**：关键节点钉钉通知（含失败任务错误首行）
-- 📚 **附带 QMT 知识库**：`skills/qmt-xtquant` 内置 xtdata/xttrader API 参考
+- 📚 **附带 QMT 知识库**：`./skills/qmt-xtquant` 内置 xtdata/xttrader API 参考
 
 ## 🗂️ 数据覆盖
 
@@ -48,11 +48,20 @@ Parquet 冷存。目标是做一个**领域无关**的自动化数据中枢 —�
 
 ```mermaid
 flowchart LR
-    QMT["QMT / MiniQMT<br/>xtdata"] --> Jobs["jobs/*<br/>run · backfill · verify"]
-    Sched["APScheduler<br/>多 cron"] --> Pipe
-    Jobs --> Pipe["Pipeline DAG<br/>拓扑排序 · 子进程隔离<br/>超时硬杀 · 重试 · 跳过下游"]
-    Pipe --> PG[("PostgreSQL<br/>结构化数据")]
+    subgraph SRC["数据源（三路异构）"]
+      QMT["QMT / MiniQMT · xtdata<br/>K线 / Tick / 财务 / 指数"]
+      HTTP["直连 HTTP<br/>东财 · 同花顺 · 新浪<br/>打板 / 期权 / 筹码"]
+      NEWS["新闻源五路<br/>AkShare · RSS · 自建RSSHub<br/>官方API · 列表页解析"]
+    end
+    QMT --> RJ["run_job.py（Windows 行情机）<br/>daily / daily_ext / weekly / monthly"]
+    HTTP --> RJ
+    NEWS --> RN["run_news.py（Linux 新闻机）<br/>news_flash / hourly / daily / stock / us"]
+    RJ --> Pipe["Pipeline DAG（共用框架）<br/>APScheduler 多 cron · 拓扑排序<br/>子进程隔离 · 超时硬杀 · 重试 · verify 补漏"]
+    RN --> Pipe
+    Pipe --> PG[("PostgreSQL<br/>K线/指数/财务<br/>打板/期权/筹码")]
     Pipe --> PQ[("Parquet 冷存<br/>Tick by day")]
+    Pipe --> OS[("OpenSearch<br/>news-{year} + 别名<br/>BM25+kNN 混合检索")]
+    Pipe --> NAS[("NAS 原始归档<br/>JSONL.gz 信封<br/>快讯唯一存档")]
     Pipe --> DD["钉钉通知"]
 ```
 
@@ -65,8 +74,8 @@ cp config.example.yaml config.yaml
 # 2. 安装依赖
 pip install -r requirements.txt
 
-# 3. 初始化数据库表
-psql -h <host> -U <user> -d ashares -f sql/001_create_divid_factors.sql
+# 3. 初始化数据库表（001~011 依序执行；部分 job 亦会自动建表）
+for f in sql/*.sql; do psql -h <host> -U <user> -d ashares -f "$f"; done
 
 # 4. 运行测试
 pytest tests/ -v
@@ -234,7 +243,7 @@ tests/                     # pytest测试
 tools/                     # 一次性脚本（如 tick 每股→按日打包迁移）
 notebooks/                 # 读测试/探索 notebook
 output/                    # 运维脚本与日志（backfill_*.ps1 长跑回补 runbook）
-/skills/            # qmt-xtquant / tick-microstructure / news-opensearch 知识库
+./skills/            # qmt-xtquant / tick-microstructure / news-opensearch 知识库
 ```
 
 ## 数据库表
@@ -297,22 +306,11 @@ ETF 与股票**物理隔离**：独立表、代码**裸 6 位**（如 `510300`�
 
 > ETF 净值/信息用 **akshare**（免费、免鉴权、跨平台）。`get_etf_codes` 依赖 MiniQMT 自维护的板块缓存，**不内联 `download_sector_data`**（无超时会阻塞）。
 
-**落地顺序**（QMT/MiniQMT 需启动）：
-1. 探针确认 ETF 板块名 → 回填 `config.yaml` 的 `etf.sectors`（脚本见 `scratchpad/probe_etf.py`）。
-2. `config.yaml` 接线：`daily` pipeline 末尾加 `etf_daily→etf_minute→etf_divid_factors`，`weekly_kline_verify` 加 ETF verify。
-3. 小样本验证：`etf_daily.run(date, limit_stocks=5)` / `etf_minute.run(date, limit_stocks=3)`，抽查列不错位。
-4. 补数据：`etf_minute` 补 2025-07 缺口 + 2025-09→今；全量 backfill；`daily_kline` 分年段补全。
-
-命令（QMT 需启动）：
+**状态：已全量投产**——五 job 全部接入 `daily` pipeline（`etf_daily→etf_minute→etf_divid_factors→etf_info→etf_nav`）+ `weekly_kline_verify` 周检补漏，历史缺口已补全。补历史命令参考（QMT 需启动，幂等可重跑）：
 
 ```bash
-# ETF 日线/分钟/复权因子补历史（可 --limit-stocks 小样本）
 python run_job.py --mode backfill --task etf_daily          --start 20100101 --end 20260705
-python run_job.py --mode backfill --task etf_minute         --start 20250701 --end 20250731   # 补 2025-07 缺口
 python run_job.py --mode backfill --task etf_divid_factors  --start 20100101 --end 20260705
-
-# daily_kline 历史补全（幂等补洞，分年段跑）
-python run_job.py --mode backfill --task a_share_daily --start 20100101 --end 20141231
 ```
 
 ### 指数表 — `index_daily` / `index_minute`
@@ -320,7 +318,7 @@ python run_job.py --mode backfill --task a_share_daily --start 20100101 --end 20
 指数与股票/ETF **物理隔离**：`ai_read` 自建两张新表，代码**带点**（`000300.SH`，`index_code` 列，xtquant 原生），字段纯 QMT `open/high/low/close/volume/amount`，**不复权**。范围 = `沪深指数` 板块 596 个有数据指数 + 北证50（剔 `395*` 无数据段），代码集 `get_index_codes()`，依赖 `a_share_sector` 板块缓存。
 
 - **`index_daily`**（日线，不分区）：`PK(index_code, trade_date)`。**全历史 backfill**——起始给统一下限 `19900101`，QMT 按各指数真实起点截断（上证 1990 / 沪深300 2002 / 北证50 2022，空段不产生行）。
-- **`index_minute`**（分钟线，**月分区** `PARTITION BY RANGE(trade_date)`）：`PK(index_code, trade_date, bar_time)`，`bar_time` 北京时间 `TIME`。**只能前向积累**——QMT 对指数 1m 仅保留近端窗口，历史 1m 全返回 0 且拉旧窗口会**无超时挂死**，故 `run_backfill` 直接 raise，历史分钟线不可回补。子分区 `index_minute_YYYY_MM` 由 `ensure_month_partition` 运行时按需创建（首月分区在 `sql/010`）。
+- **`index_minute`**（分钟线，**月分区** `PARTITION BY RANGE(trade_date)`）：`PK(index_code, trade_date, bar_time)`，`bar_time` 北京时间 `TIME`。**只能前向积累**——QMT 对指数 1m 仅保留近端窗口，历史 1m 全返回 0 且拉旧窗口会**无超时挂死**，故 `run_backfill` 直接 raise，历史分钟线不可回补。实测修订（2026-07-21）：**当天 1m 首次下载亦偶发挂起**——采集为逐批立即入库 + 按日 missing 跳过，超时硬杀不丢进度、retries+周 verify 幂等收敛。子分区 `index_minute_YYYY_MM` 由 `ensure_month_partition` 运行时按需创建（首月分区在 `sql/010`）。
 - 入库走**列名对齐**（英文列名与表一致），天然规避 `etf_minute` 那种"英文 df↔中文表退化为位置对齐"的错位坑。
 
 ```bash
@@ -729,17 +727,15 @@ NAS 不可用时同格式降级落本地 **spool 目录** + 钉钉告警，**入
 
 ### 建置清单（管理员一次性动作）
 
-运行时账号 `news_writer` 仅 `news*` 索引级 CRUD，**以下集群级/建置动作需管理员执行一次**（见 spec §5.6）：
+运行时账号 `news_writer` 仅 `news*` 索引级 CRUD，集群级/建置动作走管理员一次性执行（见 spec §5.6）。
+**2026-07-05 服务器干净重装 3.7.0 时已全部落实**：
 
-1. **分词插件**：当前无插件时索引自动降级 `standard` analyzer；装 `analysis-smartcn`（或社区 IK）后走
-   §5.4 reindex runbook 升级到中文分词（新建 `news-{year}-v2` → 归档 replay → 别名原子切换）。
-2. **hybrid search pipeline**（hybrid 模式必需）：`PUT /_search/pipeline/news-hybrid`，body 见
-   `data_collect/utils/news_search.py::ensure_hybrid_pipeline` docstring（`normalization-processor`
-   min_max + arithmetic_mean），或直接以管理员账号调该函数一次。未建置时用 `mode="rrf"` 替代。
-3. **集群设置** `action.auto_create_index: "-news*,+*"`：禁止自动创建 `news*` 索引，防误写触发动态建出
-   无 knn 设置/无中文分词/不挂别名的坏索引。
-4. **周 snapshot 仓库注册**（`path.repo` fs 仓库）：快速恢复通道，归档全量重放是终极兜底。
-5. **删除测试残留索引** `news-2099`（单测/演练可能留下的哑索引）。
+1. ✅ **分词插件** `analysis-smartcn` 已装（新建 news 索引自动中文分词；早期 standard 逐字索引已弃）。
+2. ✅ **hybrid search pipeline** `news-hybrid` 已建（`normalization-processor` min_max + arithmetic_mean；
+   body 见 `data_collect/utils/news_search.py::ensure_hybrid_pipeline` docstring，重建时以管理员调该函数一次即可）。
+3. ✅ **集群设置** `action.auto_create_index: "-news*,+*"` 已设（防误写动态建出无 knn/无分词/不挂别名的坏索引）。
+4. ⏳ **周 snapshot 仓库注册**（`path.repo` fs 仓库）可选后补：快速恢复通道，归档全量重放是终极兜底。
+5. ⏳ **删除测试残留索引** `news-2099`（单测/演练可能留下的哑索引，如存在）。
 
 ### 部署（Linux 生产机，独立于行情）
 
