@@ -1,0 +1,439 @@
+# News Source governance master data (V1.1 / Phase 1).
+# Acquisition facts such as adapter, endpoint, channel and enabled state remain
+# sourced from sources.yaml or explicit production-code facts in source_catalog.py.
+# Authority has not yet been formally assessed, so every source is explicitly
+# unrated and carries no numeric score.
+# directness describes whether the configured channel is the identified
+# publisher/origin channel; it does not assert that every individual article
+# is original. is_official is reserved for government/regulator/exchange or
+# formal disclosure channels, not merely a publisher-owned transport endpoint.
+# For overseas RSS, the repository has no explicit publisher-local timezone;
+# UTC is a provisional interpretation basis matching feedparser's parsed UTC
+# values, not a claim about publisher locale, and remains governance-revisable.
+version: 1
+
+defaults:
+  source_revision: 1
+  authority_status: unrated
+  source_authority: null
+  authority_version: source_authority_v1
+  authority_effective_from: "2026-08-16T00:00:00+08:00"
+  content_license: unknown
+  paywall_type: unknown
+  created_at: "2026-08-16T00:00:00+08:00"
+  updated_at: "2026-08-16T00:00:00+08:00"
+
+sources:
+  - source_id: govcn_policy
+    source_name: 中国政府网－政策
+    source_category: government
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: true
+  - source_id: govcn_gwy
+    source_name: 中国政府网－国务院
+    source_category: government
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: true
+  - source_id: stats
+    source_name: 国家统计局
+    source_category: government
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: true
+
+  - source_id: fed
+    source_name: Federal Reserve
+    source_category: regulator
+    directness: original
+    country_region_codes: ["US"]
+    languages: ["en"]
+    source_timezone: UTC
+    is_official: true
+  - source_id: sec_8k
+    source_name: U.S. SEC EDGAR 8-K
+    source_category: regulator
+    directness: aggregator
+    country_region_codes: ["US"]
+    languages: ["en"]
+    source_timezone: UTC
+    is_official: true
+  - source_id: nyt_business
+    source_name: The New York Times Business
+    source_category: media
+    directness: original
+    country_region_codes: ["US"]
+    languages: ["en"]
+    source_timezone: UTC
+    is_official: false
+  - source_id: nyt_economy
+    source_name: The New York Times Economy
+    source_category: media
+    directness: original
+    country_region_codes: ["US"]
+    languages: ["en"]
+    source_timezone: UTC
+    is_official: false
+  - source_id: wsj_markets
+    source_name: The Wall Street Journal Markets
+    source_category: media
+    directness: original
+    country_region_codes: ["US"]
+    languages: ["en"]
+    source_timezone: UTC
+    is_official: false
+    paywall_type: hard
+  - source_id: wsj_business
+    source_name: The Wall Street Journal Business
+    source_category: media
+    directness: original
+    country_region_codes: ["US"]
+    languages: ["en"]
+    source_timezone: UTC
+    is_official: false
+  - source_id: wsj_world
+    source_name: The Wall Street Journal World
+    source_category: media
+    directness: original
+    country_region_codes: ["US"]
+    languages: ["en"]
+    source_timezone: UTC
+    is_official: false
+  - source_id: bloomberg_markets
+    source_name: Bloomberg Markets
+    source_category: media
+    directness: original
+    country_region_codes: ["US"]
+    languages: ["en"]
+    source_timezone: UTC
+    is_official: false
+  - source_id: guardian_business
+    source_name: The Guardian Business
+    source_category: media
+    directness: original
+    country_region_codes: ["GB"]
+    languages: ["en"]
+    source_timezone: UTC
+    is_official: false
+  - source_id: marketwatch
+    source_name: MarketWatch
+    source_category: media
+    directness: original
+    country_region_codes: ["US"]
+    languages: ["en"]
+    source_timezone: UTC
+    is_official: false
+  - source_id: bbc_world
+    source_name: BBC World
+    source_category: media
+    directness: original
+    country_region_codes: ["GB"]
+    languages: ["en"]
+    source_timezone: UTC
+    is_official: false
+  - source_id: bbc_business
+    source_name: BBC Business
+    source_category: media
+    directness: original
+    country_region_codes: ["GB"]
+    languages: ["en"]
+    source_timezone: UTC
+    is_official: false
+  - source_id: bbc_tech
+    source_name: BBC Technology
+    source_category: media
+    directness: original
+    country_region_codes: ["GB"]
+    languages: ["en"]
+    source_timezone: UTC
+    is_official: false
+  - source_id: npr_news
+    source_name: NPR News
+    source_category: media
+    directness: original
+    country_region_codes: ["US"]
+    languages: ["en"]
+    source_timezone: UTC
+    is_official: false
+  - source_id: aljazeera
+    source_name: Al Jazeera
+    source_category: media
+    directness: original
+    country_region_codes: ["QA"]
+    languages: ["en"]
+    source_timezone: UTC
+    is_official: false
+
+  - source_id: ndrc
+    source_name: 国家发展和改革委员会
+    source_category: government
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: true
+  - source_id: gov_bmwj
+    source_name: 中国政府网－部门文件
+    source_category: government
+    directness: aggregator
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: true
+  - source_id: cls_red
+    source_name: 财联社加红电报
+    source_category: media
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: gelonghui
+    source_name: 格隆汇快讯
+    source_category: media
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: cls_depth
+    source_name: 财联社深度
+    source_category: media
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: caixin
+    source_name: 财新
+    source_category: media
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: thepaper
+    source_name: 澎湃新闻
+    source_category: media
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: guancha
+    source_name: 观察者网
+    source_category: media
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: ckxx
+    source_name: 参考消息
+    source_category: media
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: cctv_world
+    source_name: 央视国际
+    source_category: media
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: em_report_strategy
+    source_name: 东方财富策略研报
+    source_category: aggregator
+    directness: aggregator
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: em_report_industry
+    source_name: 东方财富行业研报
+    source_category: aggregator
+    directness: aggregator
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: em_report_macro
+    source_name: 东方财富宏观研报
+    source_category: aggregator
+    directness: aggregator
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: em_report_stock
+    source_name: 东方财富个股研报
+    source_category: aggregator
+    directness: aggregator
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: wallstreetcn_news
+    source_name: 华尔街见闻资讯
+    source_category: media
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: wallstreetcn_live
+    source_name: 华尔街见闻快讯
+    source_category: media
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: yicai
+    source_name: 第一财经
+    source_category: media
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: jiemian
+    source_name: 界面新闻
+    source_category: media
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: kr36_flash
+    source_name: 36氪快讯
+    source_category: media
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: kr36_hot
+    source_name: 36氪热榜
+    source_category: media
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: latepost
+    source_name: 晚点 LatePost
+    source_category: media
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: huxiu
+    source_name: 虎嗅
+    source_category: media
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: szse_notice
+    source_name: 深圳证券交易所公告
+    source_category: exchange
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: true
+
+  - source_id: csrc
+    source_name: 中国证券监督管理委员会
+    source_category: regulator
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: true
+  - source_id: mof
+    source_name: 中华人民共和国财政部
+    source_category: government
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: true
+  - source_id: people
+    source_name: 人民网财经
+    source_category: media
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: cctv
+    source_name: 新闻联播
+    source_category: media
+    directness: unknown
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: cninfo
+    source_name: 巨潮资讯
+    source_category: aggregator
+    directness: aggregator
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: true
+  - source_id: em_stock
+    source_name: 东方财富个股新闻
+    source_category: aggregator
+    directness: aggregator
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+
+  - source_id: cls
+    source_name: 财联社电报
+    source_category: media
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: em
+    source_name: 东方财富全球快讯
+    source_category: media
+    directness: aggregator
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: sina
+    source_name: 新浪财经全球快讯
+    source_category: media
+    directness: aggregator
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
+  - source_id: em_cjzc
+    source_name: 东方财富财经早餐
+    source_category: media
+    directness: original
+    country_region_codes: ["CN"]
+    languages: ["zh-CN"]
+    source_timezone: Asia/Shanghai
+    is_official: false
