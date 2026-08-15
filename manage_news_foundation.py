@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import sys
 
 from data_collect.news_model.source_catalog import (
@@ -44,6 +45,47 @@ def cmd_validate_sources(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_inspect_entities(args: argparse.Namespace) -> int:
+    """Inspect the Entity shadow through an explicitly enabled read-only DB path."""
+
+    if not args.connect_postgres:
+        print("Entity shadow inspection not executed")
+        print("diagnostic: PostgreSQL access requires explicit --connect-postgres")
+        print("mode: read-only/dry-run; no connection attempted")
+        return 0
+
+    # Lazy import keeps module import and validate-sources free of DB dependencies.
+    from data_collect.news_model.entity_catalog import (
+        inspect_postgres_shadow,
+    )
+
+    try:
+        inspection = inspect_postgres_shadow(
+            observed_at=datetime.now(timezone.utc),
+            limit=args.limit,
+        )
+    except Exception as exc:
+        print("Entity shadow inspection unavailable")
+        print(f"diagnostic: {exc}")
+        print("mode: read-only/dry-run; no tables or data modified")
+        return 1
+
+    snapshot = inspection.snapshot
+    print("Entity shadow inspection passed")
+    print(f"instrument columns: {', '.join(inspection.instrument_columns)}")
+    print(f"stock entities: {len(snapshot.stock_entities)}")
+    print(f"company entities: {len(snapshot.company_entities)}")
+    print(f"entity aliases: {len(snapshot.aliases)}")
+    print(f"historical aliases: {len(snapshot.historical_aliases)}")
+    print(f"sector crosswalk stocks: {len(inspection.sector_crosswalk.by_stock_code)}")
+    print(
+        "diagnostics: "
+        f"{len(snapshot.diagnostics) + len(inspection.sector_crosswalk.diagnostics)}"
+    )
+    print("mode: read-only/dry-run; no tables or data modified")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Local, read-only news foundation validation"
@@ -55,6 +97,22 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--sources-path", default=str(DEFAULT_SOURCES_PATH))
     validate.add_argument("--governance-path", default=str(DEFAULT_GOVERNANCE_PATH))
     validate.set_defaults(handler=cmd_validate_sources)
+    inspect_entities = subcommands.add_parser(
+        "inspect-entities",
+        help="inspect the stock Entity/Alias shadow through a read-only boundary",
+    )
+    inspect_entities.add_argument(
+        "--connect-postgres",
+        action="store_true",
+        help="explicitly permit a read-only PostgreSQL connection",
+    )
+    inspect_entities.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="maximum instrument_info rows to inspect (default: 100)",
+    )
+    inspect_entities.set_defaults(handler=cmd_inspect_entities)
     return parser
 
 
