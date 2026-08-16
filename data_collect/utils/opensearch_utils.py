@@ -18,11 +18,27 @@ from opensearchpy import OpenSearch, helpers
 from opensearchpy.exceptions import AuthorizationException, RequestError
 
 from data_collect.config import get_news_config, get_opensearch_config
+from data_collect.news_model.compat import (
+    build_compatibility_projection,
+    read_canonical_news,
+)
+from data_collect.news_model.opensearch_schema import PHASE1_NEWS_ADDITIVE_PROPERTIES
 
 logger = logging.getLogger(__name__)
 
 # 检索别名（读用别名，写用物理索引名）
 ALIAS = "news"
+
+# Phase 1 compatibility write gate.  Existing callers omit the parameter and
+# therefore retain the pre-Step-6 legacy behavior.
+WRITE_MODE_LEGACY = "legacy"
+WRITE_MODE_SHADOW = "shadow"
+WRITE_MODE_DUAL = "dual"
+_WRITE_MODES = frozenset({WRITE_MODE_LEGACY, WRITE_MODE_SHADOW, WRITE_MODE_DUAL})
+
+
+class NewsWriteConsistencyError(ValueError):
+    """A new document contains conflicting canonical and legacy facts."""
 
 # 年份合法界限：新闻数据最早 2016（联播历史下限），下界收紧到 2000
 # 以拦截上游时间解析事故（如 epoch 毫秒串 "1750..." 被误当年份）
@@ -64,6 +80,10 @@ _INDEX_BODY_TEMPLATE: Dict[str, Any] = {
                     "parameters": {"m": 16, "ef_construction": 128},
                 },
             },
+            # Step 5 is the single source of truth for Phase 1 field mappings.
+            # Existing indices are not changed here; this only prepares future
+            # news-{year} indices created by ensure_index().
+            **copy.deepcopy(PHASE1_NEWS_ADDITIVE_PROPERTIES),
         },
     },
 }
@@ -156,8 +176,25 @@ def index_name_for(doc: Dict[str, Any]) -> str:
     return f"news-{year}"
 
 
-def _build_actions(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """构造 create-only bulk 动作，每条自带 _index（跨年分组天然完成）。"""
+def _validate_write_mode(compatibility_mode: str) -> str:
+    if compatibility_mode not in _WRITE_MODES:
+        allowed = ", ".join(sorted(_WRITE_MODES))
+        raise ValueError(
+            f"未知 compatibility_mode={compatibility_mode!r}，允许值: {allowed}"
+        )
+    return compatibility_mode
+
+
+def _build_actions(
+    docs: List[Dict[str, Any]], *, compatibility_mode: str = WRITE_MODE_LEGACY
+) -> List[Dict[str, Any]]:
+    """构造 create-only bulk 动作，每条自带 _index（跨年分组天然完成）。
+
+    ``legacy`` 完全沿用旧写入；``shadow`` 运行兼容投影校验但仍发送旧文档；
+    ``dual`` 才发送旧字段与规范字段并存的投影副本。三个模式都使用原始旧字段
+    路由，且都不会修改调用者文档。
+    """
+    compatibility_mode = _validate_write_mode(compatibility_mode)
     actions = []
     for doc in docs:
         if "_id" not in doc:
@@ -165,18 +202,57 @@ def _build_actions(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 f"文档缺少 _id（幂等键，见架构 §5.2）: "
                 f"title={doc.get('title')!r} url={doc.get('url')!r}"
             )
+
+        source_doc = doc
+        if compatibility_mode != WRITE_MODE_LEGACY:
+            canonical_view = read_canonical_news(doc, hit_id=doc["_id"])
+            if canonical_view.has_mismatches:
+                if compatibility_mode == WRITE_MODE_DUAL:
+                    details = ", ".join(
+                        f"{item.field_name}:{item.mismatch_type.value}"
+                        for item in canonical_view.mismatches
+                    )
+                    raise NewsWriteConsistencyError(
+                        "dual write rejected conflicting compatibility fields: "
+                        f"_id={doc['_id']!r}, mismatches={details}"
+                    )
+                for item in canonical_view.mismatches:
+                    logger.warning(
+                        "compatibility shadow mismatch: "
+                        f"_id={doc['_id']!r}, field_name={item.field_name}, "
+                        f"mismatch_type={item.mismatch_type.value}"
+                    )
+
+            projected = build_compatibility_projection(doc, hit_id=doc["_id"])
+            # compat already treats this as a hard error; retain an explicit
+            # create-only boundary assertion so future compat changes cannot
+            # detach the OpenSearch _id from news_id.
+            if projected["news_id"] != doc["_id"]:
+                raise ValueError(
+                    "compatibility projection news_id must equal OpenSearch _id"
+                )
+            if compatibility_mode == WRITE_MODE_DUAL:
+                source_doc = projected
+
         actions.append(
             {
                 "_op_type": "create",  # 文档不可变：已存在 409 计 dup，防 done→pending 回退
+                # Keep the established pub_time/fetch_time routing contract;
+                # canonical publish_time never changes the target year here.
                 "_index": index_name_for(doc),
                 "_id": doc["_id"],
-                "_source": {k: v for k, v in doc.items() if k != "_id"},
+                "_source": {k: v for k, v in source_doc.items() if k != "_id"},
             }
         )
     return actions
 
 
-def bulk_create(client, docs: List[Dict[str, Any]]) -> Tuple[int, int]:
+def bulk_create(
+    client,
+    docs: List[Dict[str, Any]],
+    *,
+    compatibility_mode: str = WRITE_MODE_LEGACY,
+) -> Tuple[int, int]:
     """
     create-only 批量写入（写物理索引名）。
 
@@ -187,10 +263,11 @@ def bulk_create(client, docs: List[Dict[str, Any]]) -> Tuple[int, int]:
     - 传输层异常（连接失败/超时重试耗尽等）由 opensearchpy 原样上抛，不转 RuntimeError；
     - 混合场景可能部分成功后抛错——create-only 语义下重跑安全（已写入的变 dup）。
     """
+    compatibility_mode = _validate_write_mode(compatibility_mode)
     if not docs:
         return 0, 0
 
-    actions = _build_actions(docs)
+    actions = _build_actions(docs, compatibility_mode=compatibility_mode)
     analyzer = probe_analyzer(client)  # 一次探测，多目标索引复用
     for index_name in sorted({action["_index"] for action in actions}):
         ensure_index(client, index_name.removeprefix("news-"), analyzer=analyzer)
