@@ -20,6 +20,7 @@ import logging
 from typing import Dict, List
 
 from data_collect.config import get_news_config
+from data_collect.news_model import source_health as source_health_shadow
 from data_collect.utils import news_archive
 from data_collect.utils import news_normalize as nn
 from data_collect.utils import source_adapters as sa
@@ -35,6 +36,10 @@ from data_collect.utils.news_common import today as _today
 from data_collect.utils.news_common import verify_dates as _verify_dates
 
 logger = logging.getLogger(__name__)
+
+# Shadow monitoring is null by default and never writes OpenSearch.  Tests or
+# an explicit deployment boundary may inject a local/in-memory sink.
+_SOURCE_HEALTH_SINK = source_health_shadow.NullShadowSink()
 
 _FETCH_TIMEOUT_SECONDS = 60   # 单源拉取硬超时地板（源挂起按失败源隔离，见 news_common）
 _TZ_BEIJING = datetime.timezone(datetime.timedelta(hours=8))
@@ -62,6 +67,20 @@ def _source_names() -> tuple:
 def _alert(message: str) -> bool:
     """钉钉告警（guarded：通知失败不影响采集主流程）。"""
     return notify.guarded_send(message)
+
+
+def _emit_source_observation(**kwargs) -> None:
+    """Construct and emit one source fact without affecting collection."""
+
+    try:
+        observation = source_health_shadow.SourceObservation(**kwargs)
+        source_health_shadow.emit_shadow(
+            _SOURCE_HEALTH_SINK, observation, logger=logger
+        )
+    except Exception as exc:  # noqa: BLE001 - monitoring is strictly fail-open
+        logger.warning(
+            "政策 SourceHealth observation 构造失败（已 fail-open）: %r", exc
+        )
 
 
 # ======== 取数层 ========
@@ -255,25 +274,92 @@ def run(run_date: str | None = None, **kwargs) -> str:
 
     rss_map = _rss_sources()                  # 每轮加载一次（子进程模型=天然热生效）
     sources = tuple(rss_map) + (_CJZC_SOURCE,)
+    job_started_at = source_health_shadow.utc_now()
+    job_run_id = source_health_shadow.make_job_run_id(
+        "news_policy", job_started_at
+    )
     envelopes_by_source: Dict[str, List[dict]] = {}
+    successful_timings: Dict[str, tuple[datetime.datetime, datetime.datetime]] = {}
     failed_sources: List[str] = []
     errors: List[str] = []
     for source in sources:
+        source_started_at = source_health_shadow.utc_now()
         try:
             envelopes_by_source[source] = _collect_source(
                 source, fetch_time, name_dict, rss_map)
+            successful_timings[source] = (
+                source_started_at,
+                source_health_shadow.utc_now(),
+            )
         except Exception as exc:  # noqa: BLE001
+            source_finished_at = source_health_shadow.utc_now()
             failed_sources.append(source)
             errors.append(f"{source}: {exc!r}")
             logger.warning(f"政策源 {source} 采集失败（源级隔离，继续其余源）: {exc!r}")
+            _emit_source_observation(
+                job_run_id=job_run_id,
+                source_id=source,
+                observation_type=source_health_shadow.ObservationType.COLLECT,
+                started_at=source_started_at,
+                finished_at=source_finished_at,
+                attempt_no=1,
+                outcome=(
+                    source_health_shadow.ObservationOutcome.TIMEOUT
+                    if isinstance(exc, TimeoutError)
+                    else source_health_shadow.ObservationOutcome.FAILURE
+                ),
+                error_code=source_health_shadow.classify_error(exc),
+                error_summary=source_health_shadow.error_summary(exc),
+                incomplete=isinstance(exc, TimeoutError),
+            )
     if len(failed_sources) == len(sources):
         raise RuntimeError(f"政策源全部采集失败: {'; '.join(errors)}")
     if failed_sources:
         _alert(f"政策源 {','.join(failed_sources)} 本轮采集失败（其余源正常）: "
                f"{'; '.join(errors)[:300]}")
 
-    new_counts = {source: _archive_source(source, envelopes)
-                  for source, envelopes in envelopes_by_source.items()}
+    new_counts: Dict[str, int] = {}
+    for source, envelopes in envelopes_by_source.items():
+        started_at, finished_at = successful_timings[source]
+        try:
+            new_count = _archive_source(source, envelopes)
+        except Exception:
+            # Collection itself did succeed; archive/new count is simply not
+            # evidenced.  Preserve the original archive exception semantics.
+            _emit_source_observation(
+                job_run_id=job_run_id,
+                source_id=source,
+                observation_type=source_health_shadow.ObservationType.COLLECT,
+                started_at=started_at,
+                finished_at=finished_at,
+                attempt_no=1,
+                outcome=source_health_shadow.ObservationOutcome.SUCCESS,
+                collected_item_count=len(envelopes),
+                new_item_count=None,
+                empty_success=len(envelopes) == 0,
+                parse_failure_count=0,
+                last_item_publish_time=(
+                    source_health_shadow.latest_item_publish_time(envelopes)
+                ),
+            )
+            raise
+        new_counts[source] = new_count
+        _emit_source_observation(
+            job_run_id=job_run_id,
+            source_id=source,
+            observation_type=source_health_shadow.ObservationType.COLLECT,
+            started_at=started_at,
+            finished_at=finished_at,
+            attempt_no=1,
+            outcome=source_health_shadow.ObservationOutcome.SUCCESS,
+            collected_item_count=len(envelopes),
+            new_item_count=new_count,
+            empty_success=len(envelopes) == 0,
+            parse_failure_count=0,
+            last_item_publish_time=(
+                source_health_shadow.latest_item_publish_time(envelopes)
+            ),
+        )
 
     all_envelopes = [env for source in sources
                      for env in envelopes_by_source.get(source, [])]
@@ -307,12 +393,54 @@ def run_verify(start_date: str, end_date: str, **kwargs) -> str:
     dates = _verify_dates(days_back, _today(), include_today=True)
     window = (dates[0], dates[-1])
 
+    job_started_at = source_health_shadow.utc_now()
+    job_run_id = source_health_shadow.make_job_run_id(
+        "news_policy_verify", job_started_at
+    )
     replayed: List[dict] = []
     for source in _source_names():
+        source_started_at = source_health_shadow.utc_now()
         try:
-            replayed.extend(news_archive.replay(source, window))
+            source_replayed = list(news_archive.replay(source, window))
+            replayed.extend(source_replayed)
+            source_finished_at = source_health_shadow.utc_now()
+            _emit_source_observation(
+                job_run_id=job_run_id,
+                source_id=source,
+                observation_type=source_health_shadow.ObservationType.VERIFY,
+                started_at=source_started_at,
+                finished_at=source_finished_at,
+                attempt_no=1,
+                outcome=source_health_shadow.ObservationOutcome.SUCCESS,
+                collected_item_count=len(source_replayed),
+                completeness_status=source_health_shadow.CompletenessStatus.UNKNOWN,
+                completeness_info={
+                    "archive_replay_succeeded": True,
+                    "replayed_item_count": len(source_replayed),
+                    "window_start": window[0],
+                    "window_end": window[1],
+                },
+            )
         except Exception as exc:  # noqa: BLE001
+            source_finished_at = source_health_shadow.utc_now()
             logger.warning(f"政策 verify 重放 {source} 失败（跳过该源）: {exc!r}")
+            _emit_source_observation(
+                job_run_id=job_run_id,
+                source_id=source,
+                observation_type=source_health_shadow.ObservationType.VERIFY,
+                started_at=source_started_at,
+                finished_at=source_finished_at,
+                attempt_no=1,
+                outcome=source_health_shadow.ObservationOutcome.FAILURE,
+                error_code=source_health_shadow.classify_error(exc),
+                error_summary=source_health_shadow.error_summary(exc),
+                completeness_status=source_health_shadow.CompletenessStatus.UNKNOWN,
+                completeness_info={
+                    "archive_replay_succeeded": False,
+                    "window_start": window[0],
+                    "window_end": window[1],
+                },
+            )
 
     ok = dup = 0
     if replayed:

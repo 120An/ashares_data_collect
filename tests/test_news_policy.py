@@ -100,7 +100,9 @@ def test_cjzc_envelope_contract():
 @pytest.fixture
 def env(monkeypatch):
     calls = SimpleNamespace(bulk=[], archived=[], alerts=[])
+    health_sink = npo.source_health_shadow.InMemoryShadowSink()
     e = SimpleNamespace(calls=calls,
+                        health_sink=health_sink,
                         rss={"govcn_policy": [_entry(guid="a1")],
                              "govcn_gwy": [_entry(guid="a2",
                                                   link="https://gov.cn/gwy/2.htm")],
@@ -138,6 +140,7 @@ def env(monkeypatch):
                                          (len(list(docs)), 0))[1])
     monkeypatch.setattr(npo, "_alert", lambda msg: calls.alerts.append(msg))
     monkeypatch.setattr(npo.nn, "load_name_dict", lambda: {})
+    monkeypatch.setattr(npo, "_SOURCE_HEALTH_SINK", health_sink)
     return e
 
 
@@ -151,6 +154,19 @@ def test_run_merges_four_sources(env):
     archived_sources = {a[0] for a in env.calls.archived}
     assert archived_sources == {"govcn_policy", "govcn_gwy", "stats", "em_cjzc"}
     assert "政策:" in summary and "入库新增 4" in summary
+    observations = [
+        item for item in env.health_sink.records
+        if item.observation_type is npo.source_health_shadow.ObservationType.COLLECT
+    ]
+    assert len(observations) == 4
+    assert all(
+        item.outcome is npo.source_health_shadow.ObservationOutcome.SUCCESS
+        for item in observations
+    )
+    gov = next(item for item in observations if item.source_id == "govcn_policy")
+    assert gov.collected_item_count == 1 and gov.new_item_count == 1
+    assert gov.parse_failure_count == 0
+    assert gov.last_item_publish_time.isoformat() == "2026-07-08T10:30:00+08:00"
 
 
 def test_run_isolates_failed_source_and_alerts(env):
@@ -159,6 +175,31 @@ def test_run_isolates_failed_source_and_alerts(env):
     assert "stats 失败" in summary and "失败源[stats]" in summary
     assert len(env.calls.bulk[0]) == 3                   # 其余三源照常
     assert len(env.calls.alerts) == 1                    # 单源失败告警一次
+    failed = [
+        item for item in env.health_sink.records
+        if item.source_id == "stats"
+    ]
+    assert len(failed) == 1
+    assert failed[0].outcome is npo.source_health_shadow.ObservationOutcome.FAILURE
+    assert failed[0].collected_item_count is None
+    assert failed[0].error_code == "unknown_error"
+
+
+def test_run_records_empty_source_as_success(env):
+    env.rss["stats"] = []
+
+    summary = npo.run()
+
+    stats = [
+        item for item in env.health_sink.records
+        if item.source_id == "stats"
+    ]
+    assert len(stats) == 1
+    assert stats[0].outcome is npo.source_health_shadow.ObservationOutcome.SUCCESS
+    assert stats[0].collected_item_count == 0
+    assert stats[0].new_item_count == 0
+    assert stats[0].empty_success is True
+    assert "stats 0条(新0)" in summary
 
 
 def test_run_isolates_hanging_source(env, monkeypatch):
@@ -209,3 +250,27 @@ def test_verify_replays_archive(env, monkeypatch):
     assert env.calls.bulk[0][0]["_id"] == "govcn_policy-old"
     assert "raw_title" not in env.calls.bulk[0][0]
     assert "重放" in summary
+    verify_items = [
+        item for item in env.health_sink.records
+        if item.observation_type is npo.source_health_shadow.ObservationType.VERIFY
+    ]
+    assert len(verify_items) == 4
+    gov = next(item for item in verify_items if item.source_id == "govcn_policy")
+    assert gov.outcome is npo.source_health_shadow.ObservationOutcome.SUCCESS
+    assert gov.completeness_info["archive_replay_succeeded"] is True
+    assert gov.collected_item_count == 1
+
+
+def test_shadow_sink_failure_does_not_change_result_or_existing_alerts(env, monkeypatch):
+    class BrokenSink:
+        def emit(self, record):
+            raise OSError("shadow unavailable")
+
+    monkeypatch.setattr(npo, "_SOURCE_HEALTH_SINK", BrokenSink())
+    env.rss["stats"] = RuntimeError("RSS HTTP 503")
+
+    summary = npo.run()
+
+    assert "stats 失败" in summary
+    assert len(env.calls.bulk[0]) == 3
+    assert len(env.calls.alerts) == 1

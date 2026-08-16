@@ -21,12 +21,17 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 from data_collect.config import get_pipeline_config
+from data_collect.news_model import source_health as source_health_shadow
 from data_collect.utils.date_utils import add_mark_day, minus_one_market_day
 from data_collect.utils.notify import send_dingtalk
 
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Read-only/null by default.  Tests or an explicit deployment boundary may
+# inject a local shadow sink; pipeline never writes OpenSearch itself.
+_SOURCE_HEALTH_SINK = source_health_shadow.NullShadowSink()
 
 
 @dataclass
@@ -216,6 +221,52 @@ def _notify_retry(task_name: str, attempt: int, total: int, exc: Exception) -> N
         logger.warning(f"钉钉重试告警发送失败: {notify_exc}")
 
 
+def _observe_task(
+    *,
+    job_run_id: str,
+    attempt_no: int,
+    outcome: source_health_shadow.ObservationOutcome,
+    started_at: datetime.datetime,
+    finished_at: datetime.datetime | None,
+    latency_ms: int | None = None,
+    error_code: str | None = None,
+    error_summary: str | None = None,
+    retry_scheduled: bool = False,
+    incomplete: bool = False,
+) -> None:
+    """Best-effort task-level evidence; never infer per-source outcomes."""
+
+    try:
+        observation = source_health_shadow.SourceObservation(
+            job_run_id=job_run_id,
+            source_id=None,
+            observation_type=source_health_shadow.ObservationType.TASK,
+            started_at=started_at,
+            finished_at=finished_at,
+            attempt_no=attempt_no,
+            outcome=outcome,
+            latency_ms=latency_ms,
+            error_code=error_code,
+            error_summary=error_summary,
+            retry_scheduled=retry_scheduled,
+            incomplete=incomplete,
+            completeness_status=(
+                source_health_shadow.CompletenessStatus.UNKNOWN
+                if incomplete else None
+            ),
+            completeness_info=(
+                {"task_completion": "incomplete"} if incomplete else {}
+            ),
+        )
+        source_health_shadow.emit_shadow(
+            _SOURCE_HEALTH_SINK, observation, logger=logger
+        )
+    except Exception as exc:  # noqa: BLE001 - monitoring must stay fail-open
+        logger.warning(
+            "SourceHealth task observation 构造失败（已 fail-open）: %r", exc
+        )
+
+
 def _run_one_task(
     task_cfg: Dict[str, Any], run_date: str | None, base_kwargs: Dict[str, Any],
 ) -> TaskResult:
@@ -229,19 +280,75 @@ def _run_one_task(
 
     print(f"[pipeline] 启动任务: {task_name} (fn={fn_name}, timeout={timeout}, retries={max_retries})")
     start_time = time.monotonic()
+    job_started_at = source_health_shadow.utc_now()
+    job_run_id = source_health_shadow.make_job_run_id(task_name, job_started_at)
     last_exc: Exception | None = None
     last_tb = ""
 
     for attempt in range(1, attempts_total + 1):
+        attempt_started_at = source_health_shadow.utc_now()
+        attempt_started_monotonic = time.monotonic()
+        _observe_task(
+            job_run_id=job_run_id,
+            attempt_no=attempt,
+            outcome=source_health_shadow.ObservationOutcome.STARTED,
+            started_at=attempt_started_at,
+            finished_at=None,
+        )
         try:
             message = execute_in_subprocess(job_path, fn_name, timeout=timeout, **call_kwargs)
+            attempt_finished_at = source_health_shadow.utc_now()
+            _observe_task(
+                job_run_id=job_run_id,
+                attempt_no=attempt,
+                outcome=source_health_shadow.ObservationOutcome.SUCCESS,
+                started_at=attempt_started_at,
+                finished_at=attempt_finished_at,
+                latency_ms=max(
+                    0,
+                    int((time.monotonic() - attempt_started_monotonic) * 1000),
+                ),
+            )
             duration = time.monotonic() - start_time
             print(f"[pipeline] 完成: {task_name} ({duration:.1f}s)")
             return TaskResult(name=task_name, success=True, message=message, duration=duration)
         except Exception as exc:
             last_exc = exc
             last_tb = traceback.format_exc()
+            will_retry = attempt < attempts_total
+            timed_out = isinstance(exc, TimeoutError)
+            attempt_finished_at = source_health_shadow.utc_now()
+            _observe_task(
+                job_run_id=job_run_id,
+                attempt_no=attempt,
+                outcome=(
+                    source_health_shadow.ObservationOutcome.TIMEOUT
+                    if timed_out
+                    else source_health_shadow.ObservationOutcome.FAILURE
+                ),
+                started_at=attempt_started_at,
+                finished_at=attempt_finished_at,
+                latency_ms=max(
+                    0,
+                    int((time.monotonic() - attempt_started_monotonic) * 1000),
+                ),
+                error_code=source_health_shadow.classify_error(
+                    exc, task_level=True
+                ),
+                error_summary=source_health_shadow.error_summary(exc),
+                retry_scheduled=will_retry,
+                incomplete=timed_out,
+            )
             if attempt < attempts_total:
+                retry_at = source_health_shadow.utc_now()
+                _observe_task(
+                    job_run_id=job_run_id,
+                    attempt_no=attempt,
+                    outcome=source_health_shadow.ObservationOutcome.RETRY,
+                    started_at=retry_at,
+                    finished_at=retry_at,
+                    retry_scheduled=True,
+                )
                 _notify_retry(task_name, attempt, attempts_total, exc)
 
     duration = time.monotonic() - start_time
