@@ -80,6 +80,50 @@ class NewsYearMappingTests(unittest.TestCase):
             set(schema.PHASE1_NEWS_ADDITIVE_PROPERTIES),
         )
 
+    def test_phase1_lifecycle_and_enrichment_fields_have_frozen_types(self):
+        properties = schema.PHASE1_NEWS_ADDITIVE_PROPERTIES
+        expected_types = {
+            "embedding_model_version": "keyword",
+            "raw_archive_uri": "keyword",
+            "updated_at": "date",
+            "created_at": "date",
+            "body_truncated": "boolean",
+        }
+        self.assertEqual(
+            {name: properties[name]["type"] for name in expected_types},
+            expected_types,
+        )
+
+    def test_step7_fields_are_additive_when_missing(self):
+        diff = schema.news_year_additive_diff(_legacy_news_body())
+        additive_names = {
+            change.path.rsplit(".", 1)[-1] for change in diff.additive_changes
+        }
+        self.assertTrue({
+            "embedding_model_version", "raw_archive_uri", "updated_at",
+            "created_at", "body_truncated",
+        } <= additive_names)
+        self.assertEqual(diff.incompatible_changes, ())
+
+    def test_step7_same_name_incompatible_types_are_rejected(self):
+        expected_types = {
+            "embedding_model_version": "text",
+            "raw_archive_uri": "text",
+            "updated_at": "keyword",
+            "created_at": "keyword",
+            "body_truncated": "keyword",
+        }
+        for field_name, wrong_type in expected_types.items():
+            with self.subTest(field_name=field_name):
+                existing = _legacy_news_body()
+                existing["mappings"]["properties"][field_name] = {
+                    "type": wrong_type
+                }
+                with self.assertRaisesRegex(
+                    schema.MappingCompatibilityError, "field type differs"
+                ):
+                    schema.build_news_year_target_mapping(existing)
+
     def test_same_name_different_type_is_rejected(self):
         existing = _legacy_news_body()
         existing["mappings"]["properties"]["source_id"] = {"type": "text"}
@@ -171,7 +215,10 @@ class NewsYearMappingTests(unittest.TestCase):
         response = {"news-2026": {"mappings": _legacy_news_body()["mappings"]}}
         diff = schema.news_year_additive_diff(response)
         self.assertTrue(diff.is_additive_compatible)
-        self.assertEqual(len(diff.additive_changes), 8)
+        self.assertEqual(
+            len(diff.additive_changes),
+            len(schema.PHASE1_NEWS_ADDITIVE_PROPERTIES),
+        )
 
     def test_mapping_only_shape_is_supported(self):
         mapping = deepcopy(_legacy_news_body()["mappings"])

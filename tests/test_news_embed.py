@@ -53,7 +53,7 @@ def env(monkeypatch):
     search_responses: 按调用顺序 pop 的响应队列（dict|Exception）；
     假 Embedder 第 i 行返回全 i 向量（[i,i,i,i]），锁快照↔向量下标对齐。
     """
-    calls = SimpleNamespace(searches=[], bulk_updates=[], alerts=[],
+    calls = SimpleNamespace(searches=[], bulk_updates=[], bulk_modes=[], alerts=[],
                             encodes=[], embedder_gets=[])
     e = SimpleNamespace(calls=calls, search_responses=[],
                         encode_exc=None, bulk_exc=None)
@@ -67,13 +67,21 @@ def env(monkeypatch):
             raise resp
         return resp
 
-    def fake_bulk_update(client, updates):
+    def fake_bulk_update(
+        client,
+        updates,
+        *,
+        enrichment_mode=ne.osu.ENRICHMENT_MODE_LEGACY,
+    ):
         calls.bulk_updates.append(copy.deepcopy(list(updates)))
+        calls.bulk_modes.append(enrichment_mode)
         if e.bulk_exc is not None:
             raise e.bulk_exc
         return len(updates)
 
     class _FakeEmbedder:
+        model_name = "test/bge-model-v1"
+
         def encode(self, texts):
             calls.encodes.append(list(texts))
             if e.encode_exc is not None:
@@ -92,7 +100,11 @@ def env(monkeypatch):
     monkeypatch.setattr(ne, "send_dingtalk", lambda msg: calls.alerts.append(msg))
     monkeypatch.setattr(ne, "_now", lambda: _NOW)
     # 默认向量启用（不依赖真 config；禁用/默认用例各自覆盖）
-    monkeypatch.setattr(ne, "get_news_config", lambda: {"embedding": {"enabled": True}})
+    monkeypatch.setattr(
+        ne,
+        "get_news_config",
+        lambda: {"embedding": {"enabled": True, "model": "test/bge-model-v1"}},
+    )
     return e
 
 
@@ -117,9 +129,16 @@ def test_explicit_id_protocol_only_snapshot_written(env):
     touched_ids = {u["_id"] for batch in env.calls.bulk_updates for u in batch}
     assert "idC" not in touched_ids                    # 绝不 update_by_query 盲改
 
-    # 同一 update 原子写两字段；向量按快照下标对齐（第 i 行全 i）
-    assert updates[0]["doc"] == {"vec_status": "done", "content_vec": [0.0] * 4}
-    assert updates[1]["doc"] == {"vec_status": "done", "content_vec": [1.0] * 4}
+    # 默认 legacy：保持 Step 7 前的向量 update 形状，不写新 metadata。
+    assert updates[0]["doc"] == {
+        "vec_status": "done",
+        "content_vec": [0.0] * 4,
+    }
+    assert updates[1]["doc"] == {
+        "vec_status": "done",
+        "content_vec": [1.0] * 4,
+    }
+    assert env.calls.bulk_modes == [ne.osu.ENRICHMENT_MODE_LEGACY]
     # .tolist() 契约：Python float（np.float32 不是 float 子类，无法 JSON 序列化）
     assert all(isinstance(v, float) for v in updates[0]["doc"]["content_vec"])
 
@@ -184,9 +203,15 @@ def test_empty_text_skipped_but_marked_done(env):
     assert env.calls.encodes == [["标题A\n正文A", "仅正文"]]
     updates = env.calls.bulk_updates[0]
     assert [u["_id"] for u in updates] == ["idA", "idEmpty", "idC"]   # 三条都写回
-    assert updates[0]["doc"] == {"vec_status": "done", "content_vec": [0.0] * 4}
+    assert updates[0]["doc"] == {
+        "vec_status": "done",
+        "content_vec": [0.0] * 4,
+    }
     assert updates[1]["doc"] == {"vec_status": "done"}                # 空文本：无向量、仍 done
-    assert updates[2]["doc"] == {"vec_status": "done", "content_vec": [1.0] * 4}  # 下标不错位
+    assert updates[2]["doc"] == {
+        "vec_status": "done",
+        "content_vec": [1.0] * 4,
+    }  # 下标不错位
     assert "编码 2 条" in summary and "跳过空文本 1" in summary and "写回 3" in summary
 
 
@@ -294,6 +319,37 @@ def test_encode_error_propagates_without_writeback(env):
     with pytest.raises(RuntimeError, match="模型加载失败"):
         ne.run()
     assert env.calls.bulk_updates == []
+
+
+def test_missing_real_model_identifier_fails_without_done_or_version(env, monkeypatch):
+    """无真实 model_name 时响亮失败，不能补占位 version 或把文档置 done。"""
+    env.search_responses = [_resp([_hit("news-2026", "idA")])]
+
+    class MissingModelIdentity:
+        def encode(self, texts):
+            raise AssertionError("缺 model_name 时不应开始编码")
+
+    monkeypatch.setattr(ne.embedding, "get_embedder", lambda: MissingModelIdentity())
+    with pytest.raises(RuntimeError, match="model_name"):
+        ne.run(enrichment_mode=ne.osu.ENRICHMENT_MODE_PHASE1)
+    assert env.calls.bulk_updates == []
+
+
+def test_phase1_enrichment_writes_real_model_version_in_same_update(env):
+    env.search_responses = [
+        _resp([_hit("news-2026", "idA")]),
+        _resp([], total=0),
+    ]
+
+    ne.run(enrichment_mode=ne.osu.ENRICHMENT_MODE_PHASE1)
+
+    update = env.calls.bulk_updates[0][0]
+    assert update["doc"] == {
+        "vec_status": "done",
+        "content_vec": [0.0] * 4,
+        "embedding_model_version": "test/bge-model-v1",
+    }
+    assert env.calls.bulk_modes == [ne.osu.ENRICHMENT_MODE_PHASE1]
 
 
 def test_bulk_update_error_propagates(env):

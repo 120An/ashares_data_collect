@@ -4,6 +4,7 @@ from copy import deepcopy
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 
 import pytest
 from opensearchpy.exceptions import AuthorizationException, RequestError
@@ -333,6 +334,11 @@ def test_ensure_index_creates_with_probed_analyzer(monkeypatch):
     assert props["content"]["analyzer"] == "smartcn"
     assert body["mappings"]["_meta"] == {"analyzer": "smartcn",
                                          "embedding_model": "BAAI/bge-m3"}
+    for field_name in (
+        "embedding_model_version", "raw_archive_uri", "updated_at",
+        "created_at", "body_truncated",
+    ):
+        assert props[field_name] == osu.PHASE1_NEWS_ADDITIVE_PROPERTIES[field_name]
     assert client.indices.put_alias_calls == [("news-2026", "news")]   # 别名挂载
 
 
@@ -445,19 +451,57 @@ def test_bulk_update_action_shape(monkeypatch):
         return len(captured["actions"]), []
 
     monkeypatch.setattr(osu, "_bulk_helper", fake_bulk)
-    ok = osu.bulk_update(object(), [
+    original_updates = [
         {"_index": "news-2026", "_id": "a",
          "doc": {"vec_status": "done", "content_vec": [0.1, 0.2]}},
         {"_index": "news-2027", "_id": "b", "doc": {"vec_status": "done"}},
+    ]
+    before = deepcopy(original_updates)
+    ok = osu.bulk_update(object(), [
+        *original_updates,
     ])
     assert ok == 2
+    assert original_updates == before
     first = captured["actions"][0]
     assert first["_op_type"] == "update"
     assert first["_index"] == "news-2026" and first["_id"] == "a"
-    assert first["doc"] == {"vec_status": "done", "content_vec": [0.1, 0.2]}
+    assert first["doc"] == {
+        "vec_status": "done",
+        "content_vec": [0.1, 0.2],
+    }
     # 显式物理索引直达（跨年文档写别名有歧义），逐条各带各的 _index
     assert captured["actions"][1]["_index"] == "news-2027"
     assert captured["kw"] == {"raise_on_error": False, "stats_only": False}
+
+
+def test_phase1_bulk_update_adds_timestamp_and_requires_model_version(monkeypatch):
+    captured = []
+    monkeypatch.setattr(
+        osu,
+        "_bulk_helper",
+        lambda client, actions, **kwargs: (
+            captured.extend(actions) or len(actions), []
+        ),
+    )
+    monkeypatch.setattr(
+        osu, "_utc_now_iso", lambda: "2026-08-16T01:02:03+00:00"
+    )
+
+    assert osu.bulk_update(object(), [{
+        "_index": "news-2026",
+        "_id": "a",
+        "doc": {
+            "vec_status": "done",
+            "content_vec": [0.1, 0.2],
+            "embedding_model_version": "test-model-v1",
+        },
+    }], enrichment_mode=osu.ENRICHMENT_MODE_PHASE1) == 1
+    assert captured[0]["doc"] == {
+        "vec_status": "done",
+        "content_vec": [0.1, 0.2],
+        "embedding_model_version": "test-model-v1",
+        "updated_at": "2026-08-16T01:02:03+00:00",
+    }
 
 
 def test_bulk_update_raises_on_error(monkeypatch):
@@ -475,6 +519,122 @@ def test_bulk_update_raises_on_error(monkeypatch):
 
 def test_bulk_update_empty():
     assert osu.bulk_update(object(), []) == 0   # 空列表直返，不触库
+
+
+def test_enrichment_whitelist_rejects_original_news_facts_before_bulk(monkeypatch):
+    bulk_calls = []
+    monkeypatch.setattr(osu, "_bulk_helper", lambda *a, **k: bulk_calls.append(1))
+    for field_name, value in (
+        ("title", "新标题"),
+        ("source", "em"),
+        ("stocks", ["600519.SH"]),
+        ("pub_time", "2026-08-16 09:00:00"),
+        ("news_id", "other-id"),
+    ):
+        with pytest.raises(ValueError, match="不可变|未授权"):
+            osu.bulk_update(object(), [{
+                "_index": "news-2026", "_id": "a", "doc": {field_name: value}
+            }])
+    assert bulk_calls == []
+
+
+def test_updated_at_requires_real_enrichment_and_timezone(monkeypatch):
+    monkeypatch.setattr(osu, "_bulk_helper", lambda c, a, **k: (len(a), []))
+    with pytest.raises(ValueError, match="单独刷新 updated_at"):
+        osu.bulk_update(object(), [{
+            "_index": "news-2026", "_id": "a",
+            "doc": {"updated_at": "2026-08-16T09:00:00+08:00"},
+        }], enrichment_mode=osu.ENRICHMENT_MODE_PHASE1)
+    with pytest.raises(ValueError, match="包含时区"):
+        osu.bulk_update(object(), [{
+            "_index": "news-2026", "_id": "a",
+            "doc": {"body_status": "done", "updated_at": "2026-08-16T09:00:00"},
+        }], enrichment_mode=osu.ENRICHMENT_MODE_PHASE1)
+
+
+def test_raw_archive_uri_requires_actual_verified_receipt(monkeypatch):
+    from data_collect.utils import news_archive
+
+    captured = []
+    monkeypatch.setattr(
+        osu, "_bulk_helper",
+        lambda client, actions, **kwargs: (captured.extend(actions) or len(actions), []),
+    )
+    with pytest.raises(ValueError, match="真实 ArchiveReceipt"):
+        osu.bulk_update(object(), [{
+            "_index": "news-2026", "_id": "id-1",
+            "doc": {"raw_archive_uri": "file:///guessed/archive.jsonl.gz#news_id=id-1"},
+        }], enrichment_mode=osu.ENRICHMENT_MODE_PHASE1)
+
+    with tempfile.TemporaryDirectory(prefix="receipt-update-test-") as temp_dir:
+        root = Path(temp_dir)
+        monkeypatch.setattr(news_archive, "_archive_root", lambda: root / "nas")
+        monkeypatch.setattr(news_archive, "_spool_root", lambda: root / "spool")
+        receipt, = news_archive.append_with_receipt(
+            "cls", "20260816", [{"_id": "id-1", "title": "原文"}]
+        )
+        assert osu.bulk_update(object(), [{
+            "_index": "news-2026", "_id": "id-1",
+            "doc": {"raw_archive_uri": receipt.archive_uri},
+            "archive_receipt": receipt,
+        }], enrichment_mode=osu.ENRICHMENT_MODE_PHASE1) == 1
+    assert captured[0]["doc"]["raw_archive_uri"] == receipt.archive_uri
+    assert "archive_receipt" not in captured[0]
+
+
+def test_vector_and_model_version_must_be_atomic(monkeypatch):
+    bulk_calls = []
+    monkeypatch.setattr(osu, "_bulk_helper", lambda *a, **k: bulk_calls.append(1))
+    for doc in (
+        {"vec_status": "done", "content_vec": [0.1]},
+        {"vec_status": "done", "embedding_model_version": "model-v1"},
+        {"vec_status": "pending", "content_vec": [0.1],
+         "embedding_model_version": "model-v1"},
+    ):
+        with pytest.raises(ValueError):
+            osu.bulk_update(
+                object(),
+                [{"_index": "news-2026", "_id": "a", "doc": doc}],
+                enrichment_mode=osu.ENRICHMENT_MODE_PHASE1,
+            )
+    assert bulk_calls == []
+
+
+def test_legacy_mode_rejects_step7_metadata_and_keeps_existing_fields(monkeypatch):
+    captured = []
+    monkeypatch.setattr(
+        osu,
+        "_bulk_helper",
+        lambda client, actions, **kwargs: (
+            captured.extend(actions) or len(actions), []
+        ),
+    )
+    assert osu.bulk_update(object(), [{
+        "_index": "news-2026", "_id": "a",
+        "doc": {
+            "body": "正文",
+            "body_status": "done",
+            "body_truncated": True,
+            "vec_status": "pending",
+        },
+    }]) == 1
+    assert captured[0]["doc"] == {
+        "body": "正文",
+        "body_status": "done",
+        "body_truncated": True,
+        "vec_status": "pending",
+    }
+
+    for field_name, value in (
+        ("embedding_model_version", "model-v1"),
+        ("updated_at", "2026-08-16T09:00:00+08:00"),
+        ("raw_archive_uri", "file:///guessed"),
+    ):
+        with pytest.raises(ValueError, match="legacy enrichment_mode"):
+            osu.bulk_update(object(), [{
+                "_index": "news-2026", "_id": "b",
+                "doc": {"vec_status": "done", field_name: value},
+            }])
 
 
 # ---------- search_raw 请求参数透传 ----------

@@ -114,6 +114,41 @@ def test_append_then_load_ids_roundtrip(paths):
     assert na.load_ids("cls", "20260703") == {"id-0", "id-1", "id-2"}
 
 
+def test_append_with_receipt_reports_actual_nas_write(paths):
+    envs = [mk_env(0), mk_env(1)]
+    receipts = na.append_with_receipt("cls", "20260703", envs)
+    actual_path = na.archive_path("cls", "20260703").resolve().as_uri()
+
+    assert [receipt.news_id for receipt in receipts] == ["id-0", "id-1"]
+    assert all(receipt.storage_type is na.ArchiveStorageType.NAS for receipt in receipts)
+    assert all(receipt.success and receipt.status == "archived" for receipt in receipts)
+    assert all(receipt.archive_uri.startswith(actual_path + "#news_id=") for receipt in receipts)
+    assert all(receipt.archived_at.utcoffset() is not None for receipt in receipts)
+    assert list(na.replay("cls", ("20260703", "20260703"))) == envs
+
+
+def test_append_with_receipt_reports_actual_spool_write(paths):
+    _block(paths.nas)
+    receipts = na.append_with_receipt("cls", "20260703", [mk_env(0)])
+    spool_path = (
+        paths.spool / "raw" / "cls" / "2026" / "07" / "03.jsonl.gz"
+    ).resolve()
+
+    assert spool_path.exists()
+    assert len(receipts) == 1
+    assert receipts[0].storage_type is na.ArchiveStorageType.SPOOL
+    assert receipts[0].archive_uri == spool_path.as_uri() + "#news_id=id-0"
+    assert not receipts[0].archive_uri.startswith(paths.nas.resolve().as_uri())
+
+
+def test_append_with_receipt_complete_failure_returns_no_fabricated_uri(paths):
+    _block(paths.nas)
+    _block(paths.spool)
+    with pytest.raises(RuntimeError, match="双双失败"):
+        na.append_with_receipt("cls", "20260703", [mk_env(0)])
+    assert list(paths.spool.parent.rglob("*.jsonl.gz")) == []
+
+
 def test_load_ids_missing_file_empty(paths):
     assert na.load_ids("cls", "20260703") == set()
 
@@ -152,6 +187,31 @@ def test_two_appends_pure_append_and_replay_all(paths):
     assert len(data) > len(first_bytes)
     got = list(na.replay("cls", ("20260703", "20260703")))
     assert got == batch1 + batch2                   # 跨 gzip member 完整读回
+
+
+def test_archive_payload_is_not_polluted_by_compatibility_projection(paths):
+    from copy import deepcopy
+    from data_collect.news_model.compat import build_compatibility_projection
+
+    envelope = {
+        **mk_env(0),
+        "fetch_time": "2026-07-03 09:05:00",
+        "stocks": ["600519.SH"],
+        "raw_content": {"provider": "original", "items": [1, 2]},
+    }
+    before = deepcopy(envelope)
+    na.append_with_receipt("cls", "20260703", [envelope])
+    projected = build_compatibility_projection(envelope)
+
+    assert envelope == before
+    assert "news_id" in projected and "news_id" not in envelope
+    replayed, = na.replay("cls", ("20260703", "20260703"))
+    assert replayed == before
+    for field_name in (
+        "news_id", "schema_version", "publish_time", "collect_time",
+        "source_id", "stock_codes", "raw_archive_uri",
+    ):
+        assert field_name not in replayed
 
 
 def test_append_does_not_dedup_but_load_ids_does(paths):

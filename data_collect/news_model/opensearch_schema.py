@@ -87,6 +87,14 @@ PHASE1_NEWS_ADDITIVE_PROPERTIES: dict[str, dict[str, Any]] = {
     "stock_codes": {"type": "keyword"},
     "publish_time_precision": {"type": "keyword"},
     "publish_time_is_estimated": {"type": "boolean"},
+    # Phase 1 lifecycle/enrichment fields.  These definitions prepare future
+    # news-{year} indices and the offline additive diff only; they do not alter
+    # an already deployed index or make its mapping ready for writes.
+    "created_at": _date(),
+    "updated_at": _date(),
+    "embedding_model_version": {"type": "keyword"},
+    "raw_archive_uri": {"type": "keyword"},
+    "body_truncated": {"type": "boolean"},
 }
 
 

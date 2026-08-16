@@ -114,6 +114,18 @@ def run(run_date: str | None = None, **kwargs) -> str:
     本轮快照之后新增的 pending 不写回、留待下轮（显式 `_id` 协议，见模块 docstring）；
     编码/写回异常上抛（写回前抛则全量留 pending，重试幂等无重复向量风险）。
     """
+    enrichment_mode = kwargs.get(
+        "enrichment_mode", osu.ENRICHMENT_MODE_LEGACY
+    )
+    if enrichment_mode not in {
+        osu.ENRICHMENT_MODE_LEGACY,
+        osu.ENRICHMENT_MODE_PHASE1,
+    }:
+        raise ValueError(
+            f"未知 enrichment_mode={enrichment_mode!r}；应为 legacy 或 phase1"
+        )
+    phase1_enrichment = enrichment_mode == osu.ENRICHMENT_MODE_PHASE1
+
     # 向量延迟开关（config news.embedding.enabled，缺省 true）：置 false 则本 job
     # 立即空转——文档 vec_status 停在 pending（有意留存，非积压），日后需要向量时
     # 改回 true 跑 news_embed 一轮即全量补算。省储存（向量 ≈5KB/条，占短文档大头）。
@@ -141,14 +153,36 @@ def run(run_date: str | None = None, **kwargs) -> str:
         updates.append({"_index": index_name, "_id": doc_id, "doc": doc})
 
     if texts:
-        vectors = embedding.get_embedder().encode(texts)
+        embedder = embedding.get_embedder()
+        model_version = None
+        if phase1_enrichment:
+            model_version = str(
+                getattr(embedder, "model_name", "") or ""
+            ).strip()
+            if not model_version:
+                raise RuntimeError(
+                    "当前 Embedder 未暴露真实 model_name，"
+                    "拒绝伪造 embedding_model_version"
+                )
+        vectors = embedder.encode(texts)
         if len(vectors) != len(texts):                # 双保险：错位=向量写错文档
             raise RuntimeError(
                 f"encode 返回 {len(vectors)} 条向量，输入 {len(texts)} 条——拒绝错位写回")
         for doc, vec in zip(vec_docs, vectors):
             doc["content_vec"] = vec.tolist()         # numpy → Python float 列表（JSON 可序列化）
+            if phase1_enrichment:
+                doc["embedding_model_version"] = model_version
 
-    ok = osu.bulk_update(client, updates)             # content_vec+done 同一 update 原子写
+    if phase1_enrichment:
+        ok = osu.bulk_update(
+            client,
+            updates,
+            enrichment_mode=osu.ENRICHMENT_MODE_PHASE1,
+        )
+    else:
+        # Omit the keyword entirely to preserve the pre-Step-7 call contract
+        # for existing production adapters and tests.
+        ok = osu.bulk_update(client, updates)
 
     # 积压检查（写回后重查——快照期间新插入的 pending 计入下轮工作量与积压口径）
     total, oldest_fetch = _pending_backlog(client)

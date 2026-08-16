@@ -33,9 +33,12 @@ import logging
 import os
 import re
 import time
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Set, Tuple
+from urllib.parse import quote
 
 from data_collect.config import get_news_config
 from data_collect.utils.notify import send_dingtalk
@@ -50,6 +53,35 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # 模块级标志每轮复位——NAS 宕一天将随 */15 调度刷 ~96 条钉钉。
 _ALERT_MARKER_NAME = ".nas_alert_ts"
 _ALERT_TTL_SECONDS = 4 * 3600
+
+
+class ArchiveStorageType(str, Enum):
+    NAS = "nas"
+    SPOOL = "spool"
+
+
+_ARCHIVE_RECEIPT_PROOF = object()
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveReceipt:
+    """Evidence returned only after a concrete archive append succeeds."""
+
+    news_id: str
+    storage_type: ArchiveStorageType
+    archive_uri: str
+    archived_at: datetime
+    success: bool = True
+    status: str = "archived"
+    _proof: object = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._proof is not _ARCHIVE_RECEIPT_PROOF:
+            raise ValueError("ArchiveReceipt 只能由真实归档写入结果创建")
+
+    @property
+    def is_verified(self) -> bool:
+        return self._proof is _ARCHIVE_RECEIPT_PROOF
 
 
 def _is_posix() -> bool:
@@ -124,6 +156,28 @@ def _append_member(path: Path, blob: bytes) -> None:
         f.write(blob)
 
 
+def _archive_uri(path: Path, news_id: Any) -> str:
+    """Build a URI from the path that was actually written, never configuration."""
+
+    return f"{path.resolve().as_uri()}#news_id={quote(str(news_id), safe='')}"
+
+
+def _receipts_for_written_path(
+    envelopes: List[Dict[str, Any]], path: Path, storage_type: ArchiveStorageType
+) -> Tuple[ArchiveReceipt, ...]:
+    archived_at = datetime.now(timezone.utc)
+    return tuple(
+        ArchiveReceipt(
+            news_id=env["_id"],
+            storage_type=storage_type,
+            archive_uri=_archive_uri(path, env["_id"]),
+            archived_at=archived_at,
+            _proof=_ARCHIVE_RECEIPT_PROOF,
+        )
+        for env in envelopes
+    )
+
+
 def _iter_envelopes(path: Path) -> Iterator[Dict[str, Any]]:
     """逐行读取一个 jsonl.gz（自动跨 gzip member 拼接），yield 信封 dict。"""
     with gzip.open(path, "rt", encoding="utf-8") as f:
@@ -162,27 +216,31 @@ def _warn_nas_degraded(nas_path: Path, spool_path: Path, exc: Exception) -> None
         logger.warning(f"告警节流标记写入失败: {marker}", exc_info=True)
 
 
-def append(source: str, date: str, envelopes: Iterable[Dict[str, Any]]) -> int:
-    """追加写归档：NAS 优先，OSError 降级本地 spool，双双失败才抛 RuntimeError。
+def append_with_receipt(
+    source: str, date: str, envelopes: Iterable[Dict[str, Any]]
+) -> Tuple[ArchiveReceipt, ...]:
+    """Append envelopes and return evidence for the location actually written.
 
-    每次调用写一个独立 gzip member；不去重（重复 `_id` 原样落盘，调用方应先用
-    load_ids 过滤）。返回新写条数（落 spool 时返回值照常）。
+    Receipts are created only after the concrete NAS or spool append succeeds.
+    Complete failure raises and returns no theoretical path or fabricated URI.
+    The archived envelope bytes are produced before receipt construction and are
+    never enriched with receipt or compatibility fields.
     """
+
     envelopes = list(envelopes)
     if not envelopes:
-        return 0
+        return ()
     for env in envelopes:
         if not isinstance(env, dict) or "_id" not in env:
-            # 报错只带 keys/截断摘要，不携带信封全文（避免污染日志与钉钉首行）
             desc = f"keys={sorted(env)}" if isinstance(env, dict) else repr(env)[:200]
             raise ValueError(f"信封缺少 _id（幂等键，见架构 §5.2）: {desc}")
 
     rel = _rel_path(source, date)
-    blob = _encode_member(envelopes)  # 先序列化：数据错误（如不可 JSON 化）直接上抛
+    blob = _encode_member(envelopes)
     nas_path = _archive_root() / rel
     try:
         _append_member(nas_path, blob)
-        return len(envelopes)
+        return _receipts_for_written_path(envelopes, nas_path, ArchiveStorageType.NAS)
     except OSError as nas_exc:
         spool_path = _spool_root() / rel
         try:
@@ -192,7 +250,21 @@ def append(source: str, date: str, envelopes: Iterable[Dict[str, Any]]) -> int:
                 f"归档 NAS 与 spool 双双失败: NAS={nas_exc}; spool={spool_exc}"
             ) from spool_exc
         _warn_nas_degraded(nas_path, spool_path, nas_exc)
-        return len(envelopes)
+        return _receipts_for_written_path(
+            envelopes, spool_path, ArchiveStorageType.SPOOL
+        )
+
+
+def append(source: str, date: str, envelopes: Iterable[Dict[str, Any]]) -> int:
+    """追加写归档：NAS 优先，OSError 降级本地 spool，双双失败才抛 RuntimeError。
+
+    每次调用写一个独立 gzip member；不去重（重复 `_id` 原样落盘，调用方应先用
+    load_ids 过滤）。返回新写条数（落 spool 时返回值照常）。
+
+    这是保留给现有 job 的兼容接口；需要真实位置证据的新调用方应使用
+    :func:`append_with_receipt`。
+    """
+    return len(append_with_receipt(source, date, envelopes))
 
 
 def load_ids(source: str, date: str) -> Set[str]:

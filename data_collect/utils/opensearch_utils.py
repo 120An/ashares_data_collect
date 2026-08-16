@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
 from opensearchpy import OpenSearch, helpers
@@ -46,6 +47,32 @@ _YEAR_MIN, _YEAR_MAX = 2000, 2100
 
 # 模块级引用，便于测试 monkeypatch
 _bulk_helper = helpers.bulk
+
+# The only fields sanctioned for post-create enrichment.  Identity, source,
+# routing and original evidence fields are intentionally absent.
+ENRICHMENT_UPDATE_FIELDS = frozenset({
+    "body",
+    "body_status",
+    "body_truncated",
+    "pdf_status",
+    "content_vec",
+    "vec_status",
+    "embedding_model_version",
+    "updated_at",
+    "raw_archive_uri",
+})
+_ENRICHMENT_UPDATE_KEYS = frozenset({"_index", "_id", "doc", "archive_receipt"})
+
+# Mapping readiness is an explicit deployment decision.  The default preserves
+# pre-Step-7 production updates and therefore cannot emit newly mapped metadata.
+ENRICHMENT_MODE_LEGACY = "legacy"
+ENRICHMENT_MODE_PHASE1 = "phase1"
+_ENRICHMENT_MODES = frozenset({ENRICHMENT_MODE_LEGACY, ENRICHMENT_MODE_PHASE1})
+_PHASE1_ONLY_ENRICHMENT_FIELDS = frozenset({
+    "embedding_model_version",
+    "updated_at",
+    "raw_archive_uri",
+})
 
 # mapping 模板：analyzer 由 probe_analyzer 探测结果注入（见 _render_index_body）
 _INDEX_BODY_TEMPLATE: Dict[str, Any] = {
@@ -289,23 +316,164 @@ def bulk_create(
     return ok, dup
 
 
-def bulk_update(client, updates: List[Dict[str, Any]]) -> int:
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _validate_aware_iso(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} 必须是带时区的 ISO 8601 字符串")
+    raw = value.strip()
+    if raw.endswith(("Z", "z")):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} 必须是带时区的 ISO 8601 字符串") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{field_name} 必须包含时区")
+    return value
+
+
+def _validate_receipt_update(update: Dict[str, Any], doc: Dict[str, Any]) -> None:
+    receipt = update.get("archive_receipt")
+    if "raw_archive_uri" not in doc:
+        if receipt is not None:
+            raise ValueError("archive_receipt 只能与 raw_archive_uri 同时用于受控更新")
+        return
+    if receipt is None:
+        raise ValueError("raw_archive_uri 只能来自真实 ArchiveReceipt，不接受裸字符串")
+
+    # Lazy import keeps ordinary vector/body updates independent of archive I/O.
+    from data_collect.utils.news_archive import ArchiveReceipt
+
+    if not isinstance(receipt, ArchiveReceipt):
+        raise ValueError("raw_archive_uri 更新必须携带 ArchiveReceipt")
+    if not receipt.is_verified or not receipt.success or receipt.status != "archived":
+        raise ValueError("ArchiveReceipt 未证明归档成功")
+    if receipt.news_id != update.get("_id"):
+        raise ValueError("ArchiveReceipt.news_id 与更新 _id 不一致")
+    if receipt.archive_uri != doc.get("raw_archive_uri"):
+        raise ValueError("raw_archive_uri 与 ArchiveReceipt.archive_uri 不一致")
+
+
+def _validate_enrichment_mode(enrichment_mode: str) -> str:
+    if enrichment_mode not in _ENRICHMENT_MODES:
+        raise ValueError(
+            f"未知 enrichment_mode={enrichment_mode!r}；"
+            f"应为 {sorted(_ENRICHMENT_MODES)}"
+        )
+    return enrichment_mode
+
+
+def _build_enrichment_actions(
+    updates: List[Dict[str, Any]],
+    *,
+    enrichment_mode: str = ENRICHMENT_MODE_LEGACY,
+) -> List[Dict[str, Any]]:
+    """Validate updates and return independent OpenSearch action copies."""
+
+    enrichment_mode = _validate_enrichment_mode(enrichment_mode)
+    if not updates:
+        return []
+    phase1_enabled = enrichment_mode == ENRICHMENT_MODE_PHASE1
+    generated_updated_at = _utc_now_iso() if phase1_enabled else None
+    actions: List[Dict[str, Any]] = []
+    for position, update in enumerate(updates):
+        if not isinstance(update, dict):
+            raise ValueError(f"enrichment update[{position}] 必须是 dict")
+        unexpected_keys = set(update) - _ENRICHMENT_UPDATE_KEYS
+        if unexpected_keys:
+            raise ValueError(
+                f"enrichment update[{position}] 含未知控制字段: {sorted(unexpected_keys)}"
+            )
+        if not update.get("_index") or not update.get("_id"):
+            raise ValueError("enrichment update 必须显式提供物理 _index 和 _id")
+        raw_doc = update.get("doc")
+        if not isinstance(raw_doc, dict) or not raw_doc:
+            raise ValueError("enrichment update.doc 必须是非空 dict")
+
+        forbidden_fields = set(raw_doc) - ENRICHMENT_UPDATE_FIELDS
+        if forbidden_fields:
+            raise ValueError(
+                "enrichment update 试图修改不可变/未授权字段: "
+                f"{sorted(forbidden_fields)}"
+            )
+
+        phase1_only_fields = set(raw_doc) & _PHASE1_ONLY_ENRICHMENT_FIELDS
+        if not phase1_enabled and phase1_only_fields:
+            raise ValueError(
+                "legacy enrichment_mode 下禁止写入 mapping 尚未确认 ready 的字段: "
+                f"{sorted(phase1_only_fields)}"
+            )
+        if not phase1_enabled and update.get("archive_receipt") is not None:
+            raise ValueError(
+                "archive_receipt 仅允许在显式 phase1 enrichment_mode 下使用"
+            )
+        if phase1_enabled and set(raw_doc) == {"updated_at"}:
+            raise ValueError("不得用无实际 enrichment 变化的 update 单独刷新 updated_at")
+
+        doc = copy.deepcopy(raw_doc)
+        if phase1_enabled:
+            if "updated_at" in doc:
+                _validate_aware_iso(doc["updated_at"], "updated_at")
+            else:
+                doc["updated_at"] = generated_updated_at
+
+        has_vector = "content_vec" in doc
+        has_model = "embedding_model_version" in doc
+        if phase1_enabled:
+            if has_vector != has_model:
+                raise ValueError(
+                    "content_vec 与 embedding_model_version 必须在同一 enrichment update 中"
+                )
+            if has_vector and doc.get("vec_status") != "done":
+                raise ValueError(
+                    "content_vec 成功写入时 vec_status 必须在同一 update 中为 done"
+                )
+            if has_model and (
+                not isinstance(doc["embedding_model_version"], str)
+                or not doc["embedding_model_version"].strip()
+            ):
+                raise ValueError("embedding_model_version 必须是非空真实模型标识")
+            _validate_receipt_update(update, doc)
+        actions.append({
+            "_op_type": "update",
+            "_index": update["_index"],
+            "_id": update["_id"],
+            "doc": doc,
+        })
+    return actions
+
+
+def bulk_update(
+    client,
+    updates: List[Dict[str, Any]],
+    *,
+    enrichment_mode: str = ENRICHMENT_MODE_LEGACY,
+) -> int:
     """按显式 (_index, _id) 批量局部更新（update op），返回成功条数。
 
     - updates: ``[{"_index": 物理索引, "_id": 文档id, "doc": {局部字段}}, ...]``——
       **必须带 hit 自带的物理 _index**（跨年文档分属不同物理索引，写别名有歧义）；
-    - 与 create-only 不可变契约的关系：本函数是"补齐尚未写过的字段"的唯一豁免通道
-      （news_embed 补 content_vec/置 done、将来重置 pending 复用），不得用于改写正文；
+    - 与 create-only 不可变契约的关系：本函数是后处理字段的唯一豁免通道，只允许
+      ``ENRICHMENT_UPDATE_FIELDS``；身份、来源、时间、标题、URL、股票等原始事实禁改；
+    - 默认 ``legacy``：保持 Step 7 前的 body/PDF/vector update 形状，不产生
+      ``updated_at``，并拒绝 mapping 尚未确认 ready 的 Step 7 元数据；
+    - 显式 ``phase1``：每个真实非空 update 自动补带时区 ``updated_at``；只刷新时间
+      的空更新被拒绝；``content_vec`` 与 ``embedding_model_version`` 必须同批，且
+      ``raw_archive_uri`` 必须与同一 update 携带的真实 ``ArchiveReceipt`` 严格一致；
     - 空列表直返 0；bulk 响应内错误项（如 404）→ RuntimeError（截断列出前几条）；
     - 传输层异常由 opensearchpy 原样上抛。update 目标必已存在（来自 search 命中），
       无需 ensure_index。
     """
+    enrichment_mode = _validate_enrichment_mode(enrichment_mode)
     if not updates:
         return 0
-    actions = [
-        {"_op_type": "update", "_index": u["_index"], "_id": u["_id"], "doc": u["doc"]}
-        for u in updates
-    ]
+    actions = _build_enrichment_actions(
+        updates,
+        enrichment_mode=enrichment_mode,
+    )
     ok, errors = _bulk_helper(client, actions, raise_on_error=False, stats_only=False)
     if errors:
         raise RuntimeError(f"bulk 更新失败 {len(errors)} 条，示例: {errors[:3]}")
