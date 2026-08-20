@@ -1,9 +1,9 @@
-"""政策/宏观新闻采集任务（新闻子系统 ③：官方 RSS×3 + 东财财经早餐）。
+"""政策/宏观新闻采集任务（新闻子系统 ③：注册政策源 + 东财财经早餐）。
 
 四源单 job（source 即归档目录名）：
-- ``govcn_policy``/``govcn_gwy``/``stats``：官方 RSS（channel=policy），feedparser
-  解析（零自写 HTML 解析；2026-07-08 调研实测三源 200/有效）。RSS 源由
-  sources.yaml 注册表驱动（加减源零代码，见 spec 2026-07-08）；
+- ``govcn_policy``/``stats``：官方 RSS（channel=policy），feedparser 解析；
+- ``govcn_gwy``：中国政府网国务院政策文件库 JSON API（channel=policy）；
+- 上述注册政策源均由 sources.yaml 驱动，采集协议由 adapter 明确分派；
 - ``em_cjzc``：东财财经早餐（akshare，channel=media）。
 
 每小时轮询（news_hourly 首位），create-only 幂等；复用快讯全套健壮性模式：
@@ -17,7 +17,8 @@ from __future__ import annotations
 import datetime
 import json
 import logging
-from typing import Dict, List
+import re
+from typing import Dict, List, Mapping
 
 from data_collect.config import get_news_config
 from data_collect.news_model import source_health as source_health_shadow
@@ -46,22 +47,38 @@ _TZ_BEIJING = datetime.timezone(datetime.timedelta(hours=8))
 
 _CJZC_SOURCE = "em_cjzc"                       # 东财财经早餐（channel=media）
 _CJZC_COLUMNS = ("标题", "摘要", "发布时间", "链接")
+_GOVCN_GWY_SOURCE = "govcn_gwy"
+_GOVCN_GWY_API_PARAMS = {
+    "t": "zhengcelibrary_gw",
+    "q": "",
+    "sort": "pubtime",
+    "sortType": 1,
+    "searchfield": "title:content:summary",
+    "p": 1,
+    "n": 50,
+}
+_GOVCN_DATE_RE = re.compile(r"^\d{4}\.\d{2}\.\d{2}$")
+_SUPPORTED_REGISTRY_ADAPTERS = {"rss", "api"}
 
 
-def _rss_sources() -> Dict[str, source_registry.Source]:
-    """注册表 → {source: Source}（headers/proxy/timeout 已由加载器解析）。
+def _policy_sources() -> Dict[str, source_registry.Source]:
+    """注册表 → {source: Source}（RSS/API 采集事实均已解析）。
 
     函数化 = 热生效：子进程每轮重读 sources.yaml；测试 monkeypatch 本函数，
     与真实注册表/config 解耦（fixture 耦合教训）。
     """
-    return {s.id: s for s in source_registry.load_sources("news_policy")
-            if s.adapter == "rss"}
+    sources = source_registry.load_sources("news_policy")
+    unsupported = [s.id for s in sources
+                   if s.adapter not in _SUPPORTED_REGISTRY_ADAPTERS]
+    if unsupported:
+        raise ValueError(f"news_policy 注册源 adapter 未实现: {unsupported}")
+    return {s.id: s for s in sources}
 
 
 def _source_names() -> tuple:
-    """本 job 全部源名（注册表 rss 源 + 代码内 akshare 源；顺序即摘要顺序）。
+    """本 job 全部源名（注册政策源 + 代码内 akshare 源；顺序即摘要顺序）。
     em_cjzc（akshare）一期仍在代码（spec §11 二期登记）。"""
-    return tuple(_rss_sources()) + (_CJZC_SOURCE,)
+    return tuple(_policy_sources()) + (_CJZC_SOURCE,)
 
 
 def _alert(message: str) -> bool:
@@ -111,6 +128,69 @@ def _source_health_context(
 
 # feed 抓取单一实现在适配器层（注册表三期）；别名保留原私有名供测试 monkeypatch
 _fetch_rss_entries = sa.fetch_feed
+
+
+def _fetch_govcn_gwy_api(source: source_registry.Source) -> List[Mapping]:
+    """拉取国务院政策文件库 API；仅在此请求边界隔离 ambient proxy。
+
+    ``Source.proxy_url`` 非空时显式使用该代理；否则这个临时 Session 不继承
+    HTTP_PROXY/HTTPS_PROXY。Security/TLS 校验保持 requests 默认值且不关闭证书
+    验证。返回结构缺失不是“0 条”，而是明确的源失败。
+    """
+    import requests
+
+    session = requests.Session()
+    session.trust_env = False
+    request_kwargs = {
+        "params": dict(_GOVCN_GWY_API_PARAMS),
+        "headers": dict(source.headers),
+        "timeout": source.timeout,
+    }
+    if source.proxy_url:
+        request_kwargs["proxies"] = {
+            "http": source.proxy_url,
+            "https": source.proxy_url,
+        }
+    try:
+        response = session.get(source.url, **request_kwargs)
+        if not 200 <= response.status_code < 300:
+            raise RuntimeError(
+                f"govcn_gwy API HTTP {response.status_code}: {source.url}"
+            )
+        try:
+            payload = response.json()
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("govcn_gwy API JSON 解析失败") from exc
+    finally:
+        session.close()
+
+    if not isinstance(payload, Mapping):
+        raise RuntimeError("govcn_gwy API JSON 顶层应为 mapping")
+    if "code" in payload:
+        business_code = payload["code"]
+        success = (
+            isinstance(business_code, int)
+            and not isinstance(business_code, bool)
+            and business_code == 200
+        ) or (
+            isinstance(business_code, str)
+            and business_code.strip() == "200"
+        )
+        if not success:
+            raise RuntimeError(
+                f"govcn_gwy API 业务状态失败: code={business_code!r}"
+            )
+    search_vo = payload.get("searchVO")
+    if not isinstance(search_vo, Mapping):
+        raise RuntimeError("govcn_gwy API 缺失或无效 searchVO")
+    if "listVO" not in search_vo:
+        raise RuntimeError("govcn_gwy API 缺失 searchVO.listVO")
+    rows = search_vo["listVO"]
+    if not isinstance(rows, list):
+        raise RuntimeError("govcn_gwy API searchVO.listVO 应为 list")
+    if any(not isinstance(row, Mapping) for row in rows):
+        raise RuntimeError("govcn_gwy API searchVO.listVO 含非 mapping 条目")
+    return rows
 
 
 def _fetch_cjzc():
@@ -176,6 +256,62 @@ def _entry_to_envelope(source: str, channel: str, entry, fetch_time: str,
     return envelope
 
 
+def _govcn_gwy_pub_time(item: Mapping) -> str | None:
+    """政策库日期 → 北京时间 legacy 串；日期精度仍由 time_estimated 保留。
+
+    ``pubtimeStr`` 的当前证据只有 YYYY.MM.DD，补零点只是 legacy ``pub_time``
+    的存储兼容形态，不代表来源给出了时分秒。若该字段不可用，才保守尝试原始
+    ``pubtime``，但仍不宣称它是官方精确生效时刻。
+    """
+    raw_date = str(item.get("pubtimeStr") or "").strip()
+    if _GOVCN_DATE_RE.fullmatch(raw_date):
+        try:
+            parsed = datetime.datetime.strptime(raw_date, "%Y.%m.%d")
+        except ValueError:
+            return None
+        return parsed.strftime("%Y-%m-%d 00:00:00")
+    return nn.normalize_time(item.get("pubtime"), source=_GOVCN_GWY_SOURCE)
+
+
+def _govcn_gwy_to_envelope(item: Mapping, fetch_time: str,
+                           name_dict: Dict[str, str]) -> dict:
+    """国务院政策文件库条目 → legacy 新闻信封（日期精度不伪装）。"""
+    raw_title = str(item.get("title") or "").strip()
+    raw_summary = str(item.get("summary") or "").strip()
+    url = str(item.get("url") or "").strip()
+    native_value = item.get("id")
+    native_id = "" if native_value is None else str(native_value).strip()
+    pub_time = _govcn_gwy_pub_time(item)
+
+    title = nn.clean_text(raw_title)
+    content = nn.clean_text(raw_summary) or title
+    envelope = {
+        "_id": nn.make_id({
+            "source": _GOVCN_GWY_SOURCE,
+            "native_id": native_id or None,
+            "url": url,
+            "pub_time": pub_time,
+            "title": raw_title,
+            "content": raw_summary,
+        }),
+        "title": title,
+        "content": content,
+        "raw_title": raw_title,
+        "raw_content": json.dumps(dict(item), ensure_ascii=False, default=str),
+        "pub_time": pub_time or fetch_time,
+        "fetch_time": fetch_time,
+        "source": _GOVCN_GWY_SOURCE,
+        "channel": "policy",
+        "stocks": nn.tag_stocks(f"{title} {content}", name_dict),
+        "vec_status": "pending",
+        # 来源仅给出日期（或缺失）；00:00:00 是 legacy 兼容占位，不是精确时刻。
+        "time_estimated": True,
+    }
+    if url:
+        envelope["url"] = url
+    return envelope
+
+
 def _cjzc_to_envelope(row, fetch_time: str, name_dict: Dict[str, str]) -> dict:
     """财经早餐单行 → 信封（channel=media；`_id` 二级 sha1(链接)）。"""
     raw_title = _cell(row.get("标题")).strip()
@@ -219,11 +355,11 @@ def _load_name_dict() -> Dict[str, str]:
 
 
 def _collect_source(source: str, fetch_time: str, name_dict: Dict[str, str],
-                    rss_map: Dict[str, source_registry.Source]) -> List[dict]:
+                    source_map: Dict[str, source_registry.Source]) -> List[dict]:
     """拉取单源并信封化（批内 `_id` 去重保首见）；异常由调用方按源隔离。
 
-    rss_map 由 run() 一次加载传入（勿在此调 shim——每调一次=一次磁盘读+last-good
-    重拷，评审 S1）。em_cjzc（akshare）不走 rss_map。
+    source_map 由 run() 一次加载传入（勿在此重读——每次=一次磁盘读+last-good
+    重拷，评审 S1）。em_cjzc（akshare）不走 source_map。
     """
     if source == _CJZC_SOURCE:
         df = fetch_with_timeout(_fetch_cjzc, _FETCH_TIMEOUT_SECONDS,
@@ -237,16 +373,30 @@ def _collect_source(source: str, fetch_time: str, name_dict: Dict[str, str],
         rows = [_cjzc_to_envelope(row, fetch_time, name_dict)
                 for _, row in df.iterrows()]
     else:
-        src = rss_map[source]
-        entries = fetch_with_timeout(
-            lambda: _fetch_rss_entries(src.url, headers=src.headers,
-                                       timeout=src.timeout,
-                                       label=f"RSS {source}"),
-            sa.hard_timeout(src.timeout, _FETCH_TIMEOUT_SECONDS),
-            f"政策源 {source} 拉取")
-        rows = [_entry_to_envelope(source, src.channel, entry, fetch_time,
-                                   name_dict)
-                for entry in (entries or [])]
+        src = source_map[source]
+        if src.adapter == "api":
+            if src.id != _GOVCN_GWY_SOURCE:
+                raise ValueError(f"news_policy API 源未实现: {src.id}")
+            items = fetch_with_timeout(
+                lambda: _fetch_govcn_gwy_api(src),
+                sa.hard_timeout(src.timeout, _FETCH_TIMEOUT_SECONDS),
+                f"政策源 {source} 拉取",
+            )
+            rows = [_govcn_gwy_to_envelope(item, fetch_time, name_dict)
+                    for item in (items or [])]
+        elif src.adapter == "rss":
+            entries = fetch_with_timeout(
+                lambda: _fetch_rss_entries(src.url, headers=src.headers,
+                                           proxy=src.proxy_url,
+                                           timeout=src.timeout,
+                                           label=f"RSS {source}"),
+                sa.hard_timeout(src.timeout, _FETCH_TIMEOUT_SECONDS),
+                f"政策源 {source} 拉取")
+            rows = [_entry_to_envelope(source, src.channel, entry, fetch_time,
+                                       name_dict)
+                    for entry in (entries or [])]
+        else:  # _policy_sources 已先拒绝；保留边界防直接单测/误调用绕过。
+            raise ValueError(f"news_policy adapter 未实现: {src.adapter}")
 
     envelopes: List[dict] = []
     seen: set = set()
@@ -296,8 +446,8 @@ def run(run_date: str | None = None, **kwargs) -> str:
     fetch_time = _now().strftime("%Y-%m-%d %H:%M:%S")
     name_dict = _load_name_dict()
 
-    rss_map = _rss_sources()                  # 每轮加载一次（子进程模型=天然热生效）
-    sources = tuple(rss_map) + (_CJZC_SOURCE,)
+    source_map = _policy_sources()            # 每轮加载一次（子进程模型=天然热生效）
+    sources = tuple(source_map) + (_CJZC_SOURCE,)
     job_run_id, attempt_no = _source_health_context("news_policy", kwargs)
     envelopes_by_source: Dict[str, List[dict]] = {}
     successful_timings: Dict[str, tuple[datetime.datetime, datetime.datetime]] = {}
@@ -307,7 +457,7 @@ def run(run_date: str | None = None, **kwargs) -> str:
         source_started_at = source_health_shadow.utc_now()
         try:
             envelopes_by_source[source] = _collect_source(
-                source, fetch_time, name_dict, rss_map)
+                source, fetch_time, name_dict, source_map)
             successful_timings[source] = (
                 source_started_at,
                 source_health_shadow.utc_now(),

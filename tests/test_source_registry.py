@@ -71,6 +71,19 @@ def test_is_enabled(registry):
     assert sr.is_enabled("nonexistent") is True     # 未登记=不管辖=保持启用（向后兼容）
 
 
+def test_real_registry_loads_govcn_gwy_as_api(tmp_path, monkeypatch):
+    """真实 sources.yaml 的身份不变，只替换采集协议与 endpoint。"""
+    monkeypatch.setattr(sr, "_spool_dir", lambda: tmp_path / "spool")
+    monkeypatch.setattr(sr, "get_news_config", lambda: {})
+
+    source = next(item for item in sr.load_all() if item.id == "govcn_gwy")
+
+    assert source.adapter == "api"
+    assert source.channel == "policy" and source.job == "news_policy"
+    assert source.url == "https://sousuo.www.gov.cn/search-gov/data"
+    assert source.enabled is True
+
+
 # ---------- schema 校验（fail-fast 逐规则） ----------
 
 def _errors_of(tmp_path, text):

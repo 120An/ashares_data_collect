@@ -40,7 +40,12 @@ def fetch_feed(url, *, headers=None, proxy="", timeout=DEFAULT_HTTP_TIMEOUT,
     kwargs: dict = {"headers": headers or {}, "timeout": timeout}
     if proxy:
         kwargs["proxies"] = {"http": proxy, "https": proxy}
-    resp = requests.get(url, **kwargs)
+    session = requests.Session()
+    session.trust_env = False
+    try:
+        resp = session.get(url, **kwargs)
+    finally:
+        session.close()
     if resp.status_code != 200:
         raise RuntimeError(f"{label} HTTP {resp.status_code}: {url}")
     feed = feedparser.parse(resp.content)
@@ -116,6 +121,12 @@ def _smoke_akshare(s) -> str:
 
 
 def _smoke_api(s) -> str:
+    if s.id == "govcn_gwy":
+        from data_collect.jobs.news_policy import _fetch_govcn_gwy_api
+        rows = fetch_with_timeout(lambda: _fetch_govcn_gwy_api(s),
+                                  _SMOKE_TIMEOUT,
+                                  f"api {s.id} 冒烟")
+        return f"政策文件 {len(rows or [])} 条"
     if s.id == "cninfo":
         from data_collect.utils.cninfo import fetch_announcements
         date_iso = datetime.date.today().strftime("%Y-%m-%d")

@@ -33,6 +33,7 @@ sources:
     source_timezone: Asia/Shanghai
     is_official: true
   - source_id: govcn_gwy
+    source_revision: 2
     source_name: 中国政府网－国务院
     source_category: government
     directness: original
@@ -40,6 +41,7 @@ sources:
     languages: ["zh-CN"]
     source_timezone: Asia/Shanghai
     is_official: true
+    updated_at: "2026-08-21T00:00:00+08:00"
   - source_id: stats
     source_name: 国家统计局
     source_category: government

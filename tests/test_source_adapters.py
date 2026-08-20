@@ -16,12 +16,20 @@ class _Resp:
 def _patch_requests(monkeypatch, resp, captured=None):
     import sys
 
-    def get(url, **kw):
-        if captured is not None:
-            captured.update(kw, url=url)
-        return resp
+    class Session:
+        def __init__(self):
+            self.trust_env = True
 
-    monkeypatch.setitem(sys.modules, "requests", SimpleNamespace(get=get))
+        def get(self, url, **kw):
+            if captured is not None:
+                captured.update(kw, url=url, trust_env=self.trust_env)
+            return resp
+
+        def close(self):
+            if captured is not None:
+                captured["closed"] = True
+
+    monkeypatch.setitem(sys.modules, "requests", SimpleNamespace(Session=Session))
 
 
 def _patch_feedparser(monkeypatch, entries, bozo=0):
@@ -44,15 +52,21 @@ def test_fetch_feed_passes_headers_proxy_timeout(monkeypatch):
     assert captured["proxies"] == {"http": "http://127.0.0.1:7890",
                                    "https": "http://127.0.0.1:7890"}
     assert captured["timeout"] == 42
+    assert captured["trust_env"] is False
+    assert captured["closed"] is True
 
 
 def test_fetch_feed_no_proxy_direct(monkeypatch):
-    """空 proxy → 直连（不传 proxies，沿用环境行为——同原 news_us 语义）。"""
+    """空 proxy → 真直连，不继承 ambient HTTP_PROXY/HTTPS_PROXY。"""
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:7897")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
     captured = {}
     _patch_requests(monkeypatch, _Resp(), captured)
     _patch_feedparser(monkeypatch, [{"title": "t"}])
     sa.fetch_feed("https://x/f.xml")
     assert "proxies" not in captured
+    assert captured["trust_env"] is False
+    assert captured["closed"] is True
 
 
 def test_fetch_feed_non_200_raises(monkeypatch):
@@ -123,6 +137,24 @@ def test_smoke_listpage_missing_config_raises():
                job="news_regulator")
     with pytest.raises(RuntimeError, match="脱节"):
         sa.smoke_test(s)
+
+
+def test_smoke_dispatch_govcn_gwy_api(monkeypatch):
+    from data_collect.jobs import news_policy
+
+    monkeypatch.setattr(news_policy, "_fetch_govcn_gwy_api",
+                        lambda source: [{"id": "1"}, {"id": "2"}])
+    monkeypatch.setattr(sa, "fetch_with_timeout",
+                        lambda fn, timeout, label: fn())
+    source = Source(
+        id="govcn_gwy",
+        adapter="api",
+        channel="policy",
+        job="news_policy",
+        url="https://sousuo.www.gov.cn/search-gov/data",
+    )
+
+    assert sa.smoke_test(source) == "政策文件 2 条"
 
 
 def test_smoke_unknown_adapter_raises():

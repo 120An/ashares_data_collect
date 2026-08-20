@@ -13,7 +13,8 @@ from data_collect.utils import source_registry as sr
 _FROZEN = {
     # news_policy（url, channel, job）
     "govcn_policy": ("https://www.gov.cn/pushinfo/v150203/rss.xml", "policy", "news_policy"),
-    "govcn_gwy": ("https://www.gov.cn/guowuyuan/rss.xml", "policy", "news_policy"),
+    # source_id/归档连续，2026-08-21 停更 RSS 正式迁移到国务院政策文件库 API。
+    "govcn_gwy": ("https://sousuo.www.gov.cn/search-gov/data", "policy", "news_policy"),
     "stats": ("https://www.stats.gov.cn/sj/zxfb/rss.xml", "policy", "news_policy"),
     # news_us
     "fed": ("https://www.federalreserve.gov/feeds/press_all.xml", "us_policy", "news_us"),

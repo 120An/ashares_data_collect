@@ -155,6 +155,20 @@ class SourceObservationTests(unittest.TestCase):
         self.assertEqual(latest, datetime(2026, 8, 16, 2, 0, tzinfo=timezone.utc))
         self.assertEqual(documents, before)
 
+    def test_latest_publish_time_accepts_govcn_gwy_date_precision_envelope(self):
+        documents = [{
+            "source": "govcn_gwy",
+            "pub_time": "2026-08-18 00:00:00",
+            "time_estimated": True,
+        }]
+
+        latest = sh.latest_item_publish_time(documents)
+
+        self.assertEqual(
+            latest,
+            datetime(2026, 8, 18, 0, 0, tzinfo=timezone(timedelta(hours=8))),
+        )
+
     def test_error_classification_is_conservative_and_summary_is_bounded(self):
         self.assertEqual(sh.classify_error(TimeoutError("late")), "timeout")
         self.assertEqual(

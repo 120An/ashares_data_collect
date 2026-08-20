@@ -18,12 +18,12 @@ sources:
     headers: browser
     note: 中国政府网-最新政策
   - id: govcn_gwy
-    adapter: rss
+    adapter: api
     channel: policy
     job: news_policy
-    url: https://www.gov.cn/guowuyuan/rss.xml
+    url: https://sousuo.www.gov.cn/search-gov/data
     headers: browser
-    note: 中国政府网-国务院
+    note: 中国政府网-国务院政策文件库
   - id: stats
     adapter: rss
     channel: policy

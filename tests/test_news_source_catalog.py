@@ -199,6 +199,24 @@ class NewsSourceCatalogTests(unittest.TestCase):
             self.assertIs(record.authority_status, AuthorityStatus.UNRATED)
             self.assertIsNone(record.source_authority)
 
+    def test_govcn_gwy_keeps_identity_with_api_acquisition_revision_two(self):
+        record = self.catalog["govcn_gwy"]
+        fact = next(
+            item for item in self.registry_facts if item.source_id == "govcn_gwy"
+        )
+
+        self.assertEqual(record.source_id, "govcn_gwy")
+        self.assertIs(record.acquisition_type, AcquisitionType.API)
+        self.assertEqual(record.source_revision, 2)
+        self.assertEqual(
+            record.updated_at.isoformat(), "2026-08-21T00:00:00+08:00"
+        )
+        self.assertEqual(fact.adapter, "api")
+        self.assertEqual(
+            fact.endpoint_url,
+            "https://sousuo.www.gov.cn/search-gov/data",
+        )
+
     def test_test_fixture_source_ids_are_not_in_production_catalog(self):
         self.assertEqual(set(self.catalog) & _TEST_ONLY_SOURCE_IDS, set())
 
@@ -373,11 +391,11 @@ class NewsSourceCatalogTests(unittest.TestCase):
     def test_adapter_facts_map_to_frozen_acquisition_types(self):
         counts = Counter(record.acquisition_type for record in self.catalog.values())
 
-        self.assertEqual(counts[AcquisitionType.RSS], 18)
+        self.assertEqual(counts[AcquisitionType.RSS], 17)
         self.assertEqual(counts[AcquisitionType.RSSHUB], 23)
         self.assertEqual(counts[AcquisitionType.WEB], 3)
         self.assertEqual(counts[AcquisitionType.AKSHARE], 5)
-        self.assertEqual(counts[AcquisitionType.API], 2)
+        self.assertEqual(counts[AcquisitionType.API], 3)
 
     def test_config_selectable_flash_source_is_schedulable_not_disabled(self):
         self.assertIs(self.catalog["sina"].enabled, True)

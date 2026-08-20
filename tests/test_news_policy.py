@@ -1,6 +1,7 @@
-"""news_policy 单测：全 mock。③ 政策/宏观四源（官方 RSS×3 + 东财财经早餐）。"""
+"""news_policy 单测：全 mock。③ 政策/宏观（注册 RSS/API + 财经早餐）。"""
 
 import datetime
+import json
 import time
 from types import SimpleNamespace
 
@@ -13,15 +14,17 @@ from data_collect.utils.source_registry import Source
 _FETCH_TIME = "2026-07-08 15:00:00"
 
 
-# 测试源表：替代注册表，patch 到 npo._rss_sources（与真实 sources.yaml/config 解耦）
-def _src(sid, url, channel):
-    return Source(id=sid, adapter="rss", channel=channel, job="news_policy",
-                  url=url, headers={"User-Agent": "test"})
+# 测试源表：替代注册表，patch 到 npo._policy_sources（与真实 config 解耦）
+def _src(sid, url, channel="policy", *, adapter="rss", proxy_url=""):
+    return Source(id=sid, adapter=adapter, channel=channel, job="news_policy",
+                  url=url, proxy_url=proxy_url,
+                  headers={"User-Agent": "test"}, timeout=17)
 
 
-_TEST_RSS = {
+_TEST_POLICY = {
     "govcn_policy": _src("govcn_policy", "https://gov.cn/policy.xml", "policy"),
-    "govcn_gwy": _src("govcn_gwy", "https://gov.cn/gwy.xml", "policy"),
+    "govcn_gwy": _src("govcn_gwy", "https://sousuo.www.gov.cn/search-gov/data",
+                       adapter="api"),
     "stats": _src("stats", "https://stats.gov.cn/rss.xml", "policy"),
 }
 
@@ -46,6 +49,20 @@ def _cjzc_df(rows):
 def _cjzc_row(title="财经早餐0708", url="https://em.com/cjzc/1.html"):
     return {"标题": title, "摘要": f"{title} 摘要内容",
             "发布时间": "2026-07-08 07:30:00", "链接": url}
+
+
+def _govcn_item(summary="修改并完善住房公积金制度。"):
+    return {
+        "id": "7078478",
+        "title": "国务院关于修改《住房公积金管理条例》的决定",
+        "summary": summary,
+        "pubtimeStr": "2026.08.18",
+        "pubtime": 1786982400000,
+        "puborg": "国务院",
+        "url": "https://www.gov.cn/zhengce/zhengceku/202608/content_7078478.htm",
+        "pcode": "001",
+        "index": 1,
+    }
 
 
 # ---------- 信封契约 ----------
@@ -88,6 +105,144 @@ def test_entry_html_summary_cleaned():
     assert "<p>" not in env["content"] and "第一段A" in env["content"]
 
 
+def test_govcn_gwy_api_envelope_contract_and_raw_evidence():
+    item = _govcn_item()
+    before = dict(item)
+    env = npo._govcn_gwy_to_envelope(item, _FETCH_TIME, {})
+
+    assert env["_id"] == "govcn_gwy-7078478"
+    assert env["title"] == item["title"]
+    assert env["content"] == item["summary"]
+    assert env["url"] == item["url"]
+    assert env["source"] == "govcn_gwy" and env["channel"] == "policy"
+    assert env["pub_time"] == "2026-08-18 00:00:00"
+    assert env["time_estimated"] is True
+    assert env["vec_status"] == "pending"
+    raw = json.loads(env["raw_content"])
+    assert {key: raw[key] for key in (
+        "id", "title", "summary", "pubtimeStr", "puborg", "url"
+    )} == {key: item[key] for key in (
+        "id", "title", "summary", "pubtimeStr", "puborg", "url"
+    )}
+    assert item == before
+
+
+def test_govcn_gwy_api_empty_summary_falls_back_to_title():
+    env = npo._govcn_gwy_to_envelope(_govcn_item(summary=""), _FETCH_TIME, {})
+    assert env["content"] == env["title"]
+
+
+def test_govcn_gwy_date_precision_is_not_presented_as_exact_time():
+    env = npo._govcn_gwy_to_envelope(_govcn_item(), _FETCH_TIME, {})
+    assert env["pub_time"].endswith("00:00:00")
+    assert env["time_estimated"] is True
+    assert "publish_time_precision" not in env  # legacy envelope; dual projection owns it
+
+
+class _ApiResponse:
+    def __init__(self, payload=None, *, status_code=200, json_error=None):
+        self.payload = payload
+        self.status_code = status_code
+        self.json_error = json_error
+
+    def json(self):
+        if self.json_error is not None:
+            raise self.json_error
+        return self.payload
+
+
+class _ApiSession:
+    def __init__(self, response):
+        self.response = response
+        self.trust_env = True
+        self.calls = []
+        self.closed = False
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs, self.trust_env))
+        return self.response
+
+    def close(self):
+        self.closed = True
+
+
+def _patch_api_session(monkeypatch, response):
+    import requests
+
+    session = _ApiSession(response)
+    monkeypatch.setattr(requests, "Session", lambda: session)
+    return session
+
+
+def test_fetch_govcn_gwy_api_uses_registry_facts_and_ignores_ambient_proxy(
+        monkeypatch):
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:7897")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
+    response = _ApiResponse({
+        "code": 200,
+        "msg": "操作成功",
+        "searchVO": {"listVO": [_govcn_item()]},
+    })
+    session = _patch_api_session(monkeypatch, response)
+
+    rows = npo._fetch_govcn_gwy_api(_TEST_POLICY["govcn_gwy"])
+
+    assert rows == [_govcn_item()]
+    assert session.closed is True
+    url, kwargs, trust_env = session.calls[0]
+    assert url == _TEST_POLICY["govcn_gwy"].url
+    assert trust_env is False
+    assert "proxies" not in kwargs
+    assert "verify" not in kwargs
+    assert kwargs["headers"] == {"User-Agent": "test"}
+    assert kwargs["timeout"] == 17
+    assert kwargs["params"] == npo._GOVCN_GWY_API_PARAMS
+
+
+def test_fetch_govcn_gwy_api_respects_explicit_source_proxy(monkeypatch):
+    response = _ApiResponse({"code": "200", "searchVO": {"listVO": []}})
+    session = _patch_api_session(monkeypatch, response)
+    source = _src("govcn_gwy", _TEST_POLICY["govcn_gwy"].url,
+                  adapter="api", proxy_url="http://127.0.0.1:8899")
+
+    assert npo._fetch_govcn_gwy_api(source) == []
+    _, kwargs, trust_env = session.calls[0]
+    assert trust_env is False
+    assert kwargs["proxies"] == {
+        "http": "http://127.0.0.1:8899",
+        "https": "http://127.0.0.1:8899",
+    }
+
+
+def test_fetch_govcn_gwy_api_rejects_non_success_business_code(monkeypatch):
+    response = _ApiResponse({
+        "code": 500,
+        "msg": "操作失败",
+        "searchVO": {"listVO": []},
+    })
+    _patch_api_session(monkeypatch, response)
+
+    with pytest.raises(RuntimeError, match=r"业务状态失败: code=500"):
+        npo._fetch_govcn_gwy_api(_TEST_POLICY["govcn_gwy"])
+
+
+@pytest.mark.parametrize(
+    "response, message",
+    [
+        (_ApiResponse(status_code=503), "HTTP 503"),
+        (_ApiResponse(json_error=ValueError("bad json")), "JSON 解析失败"),
+        (_ApiResponse({}), "searchVO"),
+        (_ApiResponse({"searchVO": {}}), "listVO"),
+        (_ApiResponse({"searchVO": {"listVO": {}}}), "应为 list"),
+    ],
+)
+def test_fetch_govcn_gwy_api_rejects_http_and_malformed_payload(
+        monkeypatch, response, message):
+    _patch_api_session(monkeypatch, response)
+    with pytest.raises(RuntimeError, match=message):
+        npo._fetch_govcn_gwy_api(_TEST_POLICY["govcn_gwy"])
+
+
 def test_cjzc_envelope_contract():
     env = npo._cjzc_to_envelope(pd.Series(_cjzc_row()), _FETCH_TIME, {})
     assert env["channel"] == "media" and env["source"] == "em_cjzc"
@@ -104,28 +259,34 @@ def env(monkeypatch):
     e = SimpleNamespace(calls=calls,
                         health_sink=health_sink,
                         rss={"govcn_policy": [_entry(guid="a1")],
-                             "govcn_gwy": [_entry(guid="a2",
-                                                  link="https://gov.cn/gwy/2.htm")],
                              "stats": [_entry(guid="a3",
                                               link="https://stats.gov.cn/3.htm")]},
+                        api=[_govcn_item()],
                         cjzc=_cjzc_df([_cjzc_row()]))
 
     def fake_rss(url, **kwargs):
-        for source, src in _TEST_RSS.items():
-            if src.url == url:
+        for source, src in _TEST_POLICY.items():
+            if src.adapter == "rss" and src.url == url:
                 value = e.rss[source]
                 if isinstance(value, Exception):
                     raise value
                 return value
         raise AssertionError(f"未知 RSS url: {url}")
 
+    def fake_api(source):
+        assert source.id == "govcn_gwy" and source.adapter == "api"
+        if isinstance(e.api, Exception):
+            raise e.api
+        return e.api
+
     def fake_cjzc():
         if isinstance(e.cjzc, Exception):
             raise e.cjzc
         return e.cjzc
 
-    monkeypatch.setattr(npo, "_rss_sources", lambda: dict(_TEST_RSS))
+    monkeypatch.setattr(npo, "_policy_sources", lambda: dict(_TEST_POLICY))
     monkeypatch.setattr(npo, "_fetch_rss_entries", fake_rss)
+    monkeypatch.setattr(npo, "_fetch_govcn_gwy_api", fake_api)
     monkeypatch.setattr(npo, "_fetch_cjzc", fake_cjzc)
     monkeypatch.setattr(npo, "_now",
                         lambda: datetime.datetime(2026, 7, 8, 15, 0, 0))
@@ -170,6 +331,8 @@ def test_run_merges_four_sources(env):
     assert gov.last_item_publish_time.isoformat() == "2026-07-08T10:30:00+08:00"
     assert gov.job_run_id.startswith("jrun_")
     assert gov.attempt_no == 1
+    gwy = next(item for item in observations if item.source_id == "govcn_gwy")
+    assert gwy.last_item_publish_time.isoformat() == "2026-08-18T00:00:00+08:00"
     assert {item.job_run_id for item in observations} == {gov.job_run_id}
 
 
@@ -187,6 +350,17 @@ def test_run_isolates_failed_source_and_alerts(env):
     assert failed[0].outcome is npo.source_health_shadow.ObservationOutcome.FAILURE
     assert failed[0].collected_item_count is None
     assert failed[0].error_code == "unknown_error"
+
+
+def test_run_isolates_failed_govcn_gwy_api_and_keeps_rss_and_cjzc(env):
+    env.api = RuntimeError("govcn_gwy API HTTP 503")
+    summary = npo.run()
+    assert "govcn_gwy 失败" in summary and "失败源[govcn_gwy]" in summary
+    assert len(env.calls.bulk[0]) == 3
+    assert {doc["source"] for doc in env.calls.bulk[0]} == {
+        "govcn_policy", "stats", "em_cjzc"
+    }
+    assert len(env.calls.alerts) == 1
 
 
 def test_run_records_empty_source_as_success(env):
@@ -217,8 +391,9 @@ def test_run_isolates_hanging_source(env, monkeypatch):
 
 
 def test_run_all_sources_failed_raises(env):
-    for s in ("govcn_policy", "govcn_gwy", "stats"):
+    for s in ("govcn_policy", "stats"):
         env.rss[s] = RuntimeError("boom")
+    env.api = RuntimeError("boom")
     env.cjzc = RuntimeError("boom")
     with pytest.raises(RuntimeError, match="全部采集失败"):
         npo.run()
@@ -296,6 +471,7 @@ def test_pipeline_and_source_observations_share_context_across_retry(env, monkey
     from data_collect import pipeline as pipeline_module
 
     original_rss = dict(env.rss)
+    original_api = list(env.api)
     original_cjzc = env.cjzc
     alerts = []
 
@@ -303,10 +479,12 @@ def test_pipeline_and_source_observations_share_context_across_retry(env, monkey
         attempt = kwargs[npo.source_health_shadow.ATTEMPT_NO_CONTEXT_KEY]
         if attempt == 1:
             env.rss.update({source: RuntimeError("first attempt") for source in env.rss})
+            env.api = RuntimeError("first attempt")
             env.cjzc = RuntimeError("first attempt")
         else:
             env.rss.clear()
             env.rss.update(original_rss)
+            env.api = original_api
             env.cjzc = original_cjzc
         return npo.run(**kwargs)
 
