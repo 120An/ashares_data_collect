@@ -24,6 +24,8 @@ from data_collect.news_model.contracts import (
 
 
 SHADOW_HEALTH_POLICY_VERSION = "source_health_shadow_v1"
+JOB_RUN_ID_CONTEXT_KEY = "_source_health_job_run_id"
+ATTEMPT_NO_CONTEXT_KEY = "_source_health_attempt_no"
 _BEIJING = timezone(timedelta(hours=8), "Asia/Shanghai")
 _SUMMARY_LIMIT = 500
 
@@ -333,7 +335,9 @@ def _completed_collects(
             and item.finished_at is not None
             and window_start <= item.finished_at <= window_end
         ),
-        key=lambda item: (item.finished_at, item.attempt_no, item.observation_id),
+        key=lambda item: (
+            item.started_at, item.finished_at, item.attempt_no, item.observation_id
+        ),
     )
 
 
@@ -346,36 +350,51 @@ def build_source_health(
     observed_at: datetime | str | None = None,
     policy_version: str = SHADOW_HEALTH_POLICY_VERSION,
     is_current: bool = False,
+    previous_snapshot: SourceHealth | None = None,
 ) -> SourceHealth:
-    """Aggregate evidenced facts without inventing health scoring thresholds."""
+    """Aggregate one window while carrying only frozen latest-state fields."""
 
     source_id = validate_source_id(source_id)
     start = _aware_datetime(window_start, "window_start")
     end = _aware_datetime(window_end, "window_end")
     if start > end:
         raise ValueError("window_start 不得晚于 window_end")
+    if previous_snapshot is not None:
+        if previous_snapshot.source_id != source_id:
+            raise ValueError("previous_snapshot.source_id 必须与 source_id 一致")
+        if previous_snapshot.window_end > start:
+            raise ValueError(
+                "previous_snapshot.window_end 不得晚于当前 window_start"
+            )
     observed = _aware_datetime(observed_at or utc_now(), "observed_at")
     collects = _completed_collects(source_id, observations, start, end)
     successes = [item for item in collects if item.outcome is ObservationOutcome.SUCCESS]
 
-    consecutive_failures = 0
+    consecutive_failures = (
+        previous_snapshot.consecutive_failures if previous_snapshot else 0
+    )
     for item in collects:
         if item.outcome is ObservationOutcome.SUCCESS:
             consecutive_failures = 0
         else:
             consecutive_failures += 1
 
-    latest_collect = collects[-1] if collects else None
-    last_success = max(
-        (item.finished_at for item in successes), default=None
-    )
-    last_publish = max(
-        (
-            item.last_item_publish_time for item in collects
-            if item.last_item_publish_time is not None
-        ),
+    latest_collect = max(
+        collects,
+        key=lambda item: (item.started_at, item.finished_at, item.observation_id),
         default=None,
     )
+    last_success = max(
+        (item.finished_at for item in successes),
+        default=(previous_snapshot.last_success_at if previous_snapshot else None),
+    )
+    publish_candidates = [
+        item.last_item_publish_time for item in collects
+        if item.last_item_publish_time is not None
+    ]
+    if previous_snapshot and previous_snapshot.last_item_publish_time is not None:
+        publish_candidates.append(previous_snapshot.last_item_publish_time)
+    last_publish = max(publish_candidates, default=None)
     data_delay = None
     if last_publish is not None and last_publish <= observed:
         data_delay = int((observed - last_publish).total_seconds())
@@ -429,9 +448,19 @@ def build_source_health(
         last_success_at=last_success,
         # V1.1 defines this as the time the latest collection attempt began,
         # not when it happened to finish.
-        last_attempt_at=latest_collect.started_at if latest_collect else None,
+        last_attempt_at=(
+            latest_collect.started_at
+            if latest_collect else (
+                previous_snapshot.last_attempt_at if previous_snapshot else None
+            )
+        ),
         consecutive_failures=consecutive_failures,
-        latency_ms=latest_collect.latency_ms if latest_collect else None,
+        latency_ms=(
+            latest_collect.latency_ms
+            if latest_collect else (
+                previous_snapshot.latency_ms if previous_snapshot else None
+            )
+        ),
         attempt_count=len(collects),
         success_count=len(successes),
         collected_item_count=sum(
@@ -536,7 +565,9 @@ def emit_shadow(
 
 
 __all__ = [
+    "ATTEMPT_NO_CONTEXT_KEY",
     "InMemoryShadowSink",
+    "JOB_RUN_ID_CONTEXT_KEY",
     "JsonlShadowSink",
     "NullShadowSink",
     "ObservationOutcome",

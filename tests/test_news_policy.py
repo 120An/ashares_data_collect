@@ -164,9 +164,13 @@ def test_run_merges_four_sources(env):
         for item in observations
     )
     gov = next(item for item in observations if item.source_id == "govcn_policy")
-    assert gov.collected_item_count == 1 and gov.new_item_count == 1
+    assert gov.collected_item_count == 1 and gov.new_item_count is None
+    assert gov.completeness_info["archive_new_item_count"] == 1
     assert gov.parse_failure_count == 0
     assert gov.last_item_publish_time.isoformat() == "2026-07-08T10:30:00+08:00"
+    assert gov.job_run_id.startswith("jrun_")
+    assert gov.attempt_no == 1
+    assert {item.job_run_id for item in observations} == {gov.job_run_id}
 
 
 def test_run_isolates_failed_source_and_alerts(env):
@@ -197,7 +201,8 @@ def test_run_records_empty_source_as_success(env):
     assert len(stats) == 1
     assert stats[0].outcome is npo.source_health_shadow.ObservationOutcome.SUCCESS
     assert stats[0].collected_item_count == 0
-    assert stats[0].new_item_count == 0
+    assert stats[0].new_item_count is None
+    assert stats[0].completeness_info["archive_new_item_count"] == 0
     assert stats[0].empty_success is True
     assert "stats 0条(新0)" in summary
 
@@ -259,6 +264,85 @@ def test_verify_replays_archive(env, monkeypatch):
     assert gov.outcome is npo.source_health_shadow.ObservationOutcome.SUCCESS
     assert gov.completeness_info["archive_replay_succeeded"] is True
     assert gov.collected_item_count == 1
+
+
+def test_verify_uses_pipeline_health_context_when_provided(env, monkeypatch):
+    monkeypatch.setattr(npo, "get_news_config", lambda: {"verify_days_back": 1})
+    monkeypatch.setattr(npo, "_today", lambda: datetime.date(2026, 7, 8))
+    monkeypatch.setattr(npo.news_archive, "replay", lambda source, window: iter([]))
+    run_id = npo.source_health_shadow.make_job_run_id(
+        "news_policy_verify", datetime.datetime(2026, 7, 8, tzinfo=datetime.timezone.utc)
+    )
+
+    npo.run_verify(
+        "20990101",
+        "20990102",
+        **{
+            npo.source_health_shadow.JOB_RUN_ID_CONTEXT_KEY: run_id,
+            npo.source_health_shadow.ATTEMPT_NO_CONTEXT_KEY: 2,
+        },
+    )
+
+    verify_items = [
+        item for item in env.health_sink.records
+        if item.observation_type is npo.source_health_shadow.ObservationType.VERIFY
+    ]
+    assert verify_items
+    assert {item.job_run_id for item in verify_items} == {run_id}
+    assert {item.attempt_no for item in verify_items} == {2}
+
+
+def test_pipeline_and_source_observations_share_context_across_retry(env, monkeypatch):
+    from data_collect import pipeline as pipeline_module
+
+    original_rss = dict(env.rss)
+    original_cjzc = env.cjzc
+    alerts = []
+
+    def in_process(job_path, fn_name, timeout=None, **kwargs):
+        attempt = kwargs[npo.source_health_shadow.ATTEMPT_NO_CONTEXT_KEY]
+        if attempt == 1:
+            env.rss.update({source: RuntimeError("first attempt") for source in env.rss})
+            env.cjzc = RuntimeError("first attempt")
+        else:
+            env.rss.clear()
+            env.rss.update(original_rss)
+            env.cjzc = original_cjzc
+        return npo.run(**kwargs)
+
+    monkeypatch.setattr(pipeline_module, "_SOURCE_HEALTH_SINK", env.health_sink)
+    monkeypatch.setattr(pipeline_module, "execute_in_subprocess", in_process)
+    monkeypatch.setattr(
+        pipeline_module, "send_dingtalk", lambda message: alerts.append(message)
+    )
+
+    result = pipeline_module._run_one_task(
+        {
+            "name": "news_policy",
+            "job": "data_collect.jobs.news_policy",
+            "retries": 1,
+        },
+        None,
+        {},
+    )
+
+    assert result.success is True
+    task_items = [
+        item for item in env.health_sink.records
+        if item.observation_type is npo.source_health_shadow.ObservationType.TASK
+    ]
+    source_items = [
+        item for item in env.health_sink.records
+        if item.observation_type is npo.source_health_shadow.ObservationType.COLLECT
+    ]
+    run_ids = {item.job_run_id for item in task_items + source_items}
+    assert len(run_ids) == 1
+    assert {
+        item.attempt_no for item in task_items
+        if item.outcome is npo.source_health_shadow.ObservationOutcome.STARTED
+    } == {1, 2}
+    assert {item.attempt_no for item in source_items} == {1, 2}
+    assert len(alerts) == 1
 
 
 def test_shadow_sink_failure_does_not_change_result_or_existing_alerts(env, monkeypatch):

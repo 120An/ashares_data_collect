@@ -144,7 +144,7 @@ def test_pipeline_retry_count_and_notify_count_are_unchanged(monkeypatch):
     alerts = []
 
     def flaky(*args, **kwargs):
-        calls.append(1)
+        calls.append(dict(kwargs))
         if len(calls) < 3:
             raise RuntimeError("retry me")
         return "ok"
@@ -163,6 +163,11 @@ def test_pipeline_retry_count_and_notify_count_are_unchanged(monkeypatch):
 
     assert result.success is True and result.message == "ok"
     assert len(calls) == 3                         # 1 initial + exactly 2 retries
+    assert all(
+        source_health_shadow.JOB_RUN_ID_CONTEXT_KEY not in kwargs
+        and source_health_shadow.ATTEMPT_NO_CONTEXT_KEY not in kwargs
+        for kwargs in calls
+    )                                             # 非 news_policy kwargs 不变
     assert len(alerts) == 2                       # original pre-retry alerts only
     retry_events = [
         item for item in sink.records
@@ -174,6 +179,78 @@ def test_pipeline_retry_count_and_notify_count_are_unchanged(monkeypatch):
     ]
     assert len(retry_events) == 2
     assert len(started_events) == 3
+
+
+def test_news_policy_retry_context_keeps_job_id_and_increments_attempt(monkeypatch):
+    sink = source_health_shadow.InMemoryShadowSink()
+    calls = []
+
+    def flaky(*args, **kwargs):
+        calls.append(dict(kwargs))
+        if len(calls) == 1:
+            raise RuntimeError("retry once")
+        return "ok"
+
+    monkeypatch.setattr(pipeline_module, "_SOURCE_HEALTH_SINK", sink)
+    monkeypatch.setattr(pipeline_module, "execute_in_subprocess", flaky)
+    monkeypatch.setattr(pipeline_module, "send_dingtalk", lambda message: None)
+
+    result = pipeline_module._run_one_task(
+        {
+            "name": "news_policy",
+            "job": "data_collect.jobs.news_policy",
+            "retries": 1,
+        },
+        None,
+        {},
+    )
+
+    assert result.success is True
+    run_ids = [
+        kwargs[source_health_shadow.JOB_RUN_ID_CONTEXT_KEY]
+        for kwargs in calls
+    ]
+    attempt_numbers = [
+        kwargs[source_health_shadow.ATTEMPT_NO_CONTEXT_KEY]
+        for kwargs in calls
+    ]
+    assert len(set(run_ids)) == 1
+    assert attempt_numbers == [1, 2]
+    task_items = [
+        item for item in sink.records
+        if item.observation_type is source_health_shadow.ObservationType.TASK
+    ]
+    assert {item.job_run_id for item in task_items} == {run_ids[0]}
+    assert {
+        item.attempt_no for item in task_items
+        if item.outcome is source_health_shadow.ObservationOutcome.STARTED
+    } == {1, 2}
+
+
+def test_news_policy_verify_receives_same_internal_context(monkeypatch):
+    captured = []
+    monkeypatch.setattr(
+        pipeline_module,
+        "execute_in_subprocess",
+        lambda *args, **kwargs: captured.append(dict(kwargs)) or "ok",
+    )
+
+    result = pipeline_module._run_one_task(
+        {
+            "name": "news_policy_verify",
+            "job": "data_collect.jobs.news_policy",
+            "fn": "run_verify",
+            "days_back": 1,
+        },
+        None,
+        {},
+    )
+
+    assert result.success is True
+    assert captured[0][source_health_shadow.JOB_RUN_ID_CONTEXT_KEY].startswith(
+        "jrun_"
+    )
+    assert captured[0][source_health_shadow.ATTEMPT_NO_CONTEXT_KEY] == 1
 
 
 def test_pipeline_timeout_is_task_level_unknown_and_incomplete(monkeypatch):

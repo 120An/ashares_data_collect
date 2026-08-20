@@ -52,13 +52,22 @@ def _collect(
     )
 
 
-def _snapshot(observations, *, start=_T0, end=_T2):
+def _snapshot(
+    observations,
+    *,
+    start=_T0,
+    end=_T2,
+    observed=None,
+    previous=None,
+    source_id="govcn_policy",
+):
     return sh.build_source_health(
-        source_id="govcn_policy",
+        source_id=source_id,
         observations=observations,
         window_start=start,
         window_end=end,
-        observed_at=end,
+        observed_at=observed or end,
+        previous_snapshot=previous,
     )
 
 
@@ -223,6 +232,20 @@ class SourceHealthAggregationTests(unittest.TestCase):
         self.assertEqual(snapshot.empty_success_count, 1)
         self.assertEqual(snapshot.consecutive_failures, 0)
 
+    def test_unknown_new_item_count_is_explicit_not_proven_zero(self):
+        observation = _collect(
+            sh.ObservationOutcome.SUCCESS,
+            collected=3,
+            new=None,
+            empty=False,
+            parse_failures=0,
+        )
+        snapshot = _snapshot([observation])
+        self.assertEqual(snapshot.new_item_count, 0)
+        self.assertEqual(
+            snapshot.completeness_metrics["unknown_new_item_attempt_count"], 1
+        )
+
     def test_consecutive_failures_reset_after_success(self):
         first = _collect(
             sh.ObservationOutcome.FAILURE,
@@ -248,6 +271,179 @@ class SourceHealthAggregationTests(unittest.TestCase):
         self.assertEqual(
             _snapshot([first, second, recovered]).consecutive_failures, 0
         )
+
+    def test_previous_success_survives_current_failure_window(self):
+        previous = _snapshot([
+            _collect(
+                sh.ObservationOutcome.SUCCESS,
+                started_at=_T0,
+                finished_at=_T1,
+                collected=1,
+                new=1,
+                empty=False,
+                parse_failures=0,
+            )
+        ], start=_T0, end=_T1)
+        failure = _collect(
+            sh.ObservationOutcome.FAILURE,
+            started_at=_T1 + timedelta(minutes=10),
+            finished_at=_T2,
+            error_code="network_error",
+        )
+        current = _snapshot(
+            [failure], start=_T1, end=_T2, previous=previous
+        )
+        self.assertEqual(current.last_success_at, _T1)
+        self.assertEqual(current.consecutive_failures, 1)
+
+    def test_previous_failure_streak_is_extended_without_current_success(self):
+        previous_failures = [
+            _collect(
+                sh.ObservationOutcome.FAILURE,
+                started_at=_T0 + timedelta(minutes=index * 10),
+                finished_at=_T0 + timedelta(minutes=index * 10 + 5),
+                error_code="network_error",
+            )
+            for index in range(3)
+        ]
+        previous = _snapshot(previous_failures, start=_T0, end=_T1)
+        current_failure = _collect(
+            sh.ObservationOutcome.TIMEOUT,
+            started_at=_T1 + timedelta(minutes=10),
+            finished_at=_T2,
+            error_code="timeout",
+        )
+        current = _snapshot(
+            [current_failure], start=_T1, end=_T2, previous=previous
+        )
+        self.assertEqual(current.consecutive_failures, 4)
+
+    def test_current_success_resets_previous_failure_streak(self):
+        previous = _snapshot([
+            _collect(
+                sh.ObservationOutcome.FAILURE,
+                started_at=_T0 + timedelta(minutes=index * 10),
+                finished_at=_T0 + timedelta(minutes=index * 10 + 5),
+                error_code="network_error",
+            )
+            for index in range(3)
+        ], start=_T0, end=_T1)
+        current = _snapshot([
+            _collect(
+                sh.ObservationOutcome.FAILURE,
+                started_at=_T1 + timedelta(minutes=5),
+                finished_at=_T1 + timedelta(minutes=10),
+                error_code="network_error",
+            ),
+            _collect(
+                sh.ObservationOutcome.SUCCESS,
+                started_at=_T1 + timedelta(minutes=15),
+                finished_at=_T1 + timedelta(minutes=20),
+                collected=1,
+                new=1,
+                empty=False,
+                parse_failures=0,
+            ),
+        ], start=_T1, end=_T2, previous=previous)
+        self.assertEqual(current.consecutive_failures, 0)
+
+    def test_only_failures_after_current_success_remain_consecutive(self):
+        previous = _snapshot([
+            _collect(
+                sh.ObservationOutcome.FAILURE,
+                started_at=_T0 + timedelta(minutes=index * 10),
+                finished_at=_T0 + timedelta(minutes=index * 10 + 5),
+                error_code="network_error",
+            )
+            for index in range(3)
+        ], start=_T0, end=_T1)
+        current = _snapshot([
+            _collect(
+                sh.ObservationOutcome.FAILURE,
+                started_at=_T1 + timedelta(minutes=5),
+                finished_at=_T1 + timedelta(minutes=10),
+                error_code="network_error",
+            ),
+            _collect(
+                sh.ObservationOutcome.SUCCESS,
+                started_at=_T1 + timedelta(minutes=15),
+                finished_at=_T1 + timedelta(minutes=20),
+                collected=1,
+                new=1,
+                empty=False,
+                parse_failures=0,
+            ),
+            _collect(
+                sh.ObservationOutcome.FAILURE,
+                started_at=_T1 + timedelta(minutes=25),
+                finished_at=_T1 + timedelta(minutes=30),
+                error_code="network_error",
+            ),
+        ], start=_T1, end=_T2, previous=previous)
+        self.assertEqual(current.consecutive_failures, 1)
+
+    def test_empty_window_carries_state_but_never_window_counts(self):
+        previous = _snapshot([
+            _collect(
+                sh.ObservationOutcome.SUCCESS,
+                started_at=_T0,
+                finished_at=_T1,
+                collected=5,
+                new=2,
+                empty=False,
+                parse_failures=1,
+                last_publish=_T0,
+            )
+        ], start=_T0, end=_T1)
+        current = _snapshot([], start=_T1, end=_T2, previous=previous)
+        self.assertEqual(current.last_success_at, previous.last_success_at)
+        self.assertEqual(current.last_attempt_at, previous.last_attempt_at)
+        self.assertEqual(current.latency_ms, previous.latency_ms)
+        self.assertEqual(
+            current.last_item_publish_time, previous.last_item_publish_time
+        )
+        self.assertEqual(current.consecutive_failures, previous.consecutive_failures)
+        self.assertEqual(current.attempt_count, 0)
+        self.assertEqual(current.success_count, 0)
+        self.assertEqual(current.collected_item_count, 0)
+        self.assertEqual(current.new_item_count, 0)
+        self.assertEqual(current.empty_success_count, 0)
+        self.assertEqual(current.parse_failure_count, 0)
+        self.assertEqual(current.completeness_status, CompletenessStatus.UNKNOWN)
+
+    def test_previous_snapshot_source_mismatch_is_rejected(self):
+        previous = _snapshot(
+            [], start=_T0, end=_T1, source_id="stats"
+        )
+        with self.assertRaisesRegex(ValueError, "source_id"):
+            _snapshot([], start=_T1, end=_T2, previous=previous)
+
+    def test_overlapping_or_future_previous_window_is_rejected(self):
+        previous = _snapshot(
+            [], start=_T0, end=_T1 + timedelta(minutes=1)
+        )
+        with self.assertRaisesRegex(ValueError, "window_end"):
+            _snapshot([], start=_T1, end=_T2, previous=previous)
+
+    def test_carried_publish_time_recomputes_delay_at_current_observation(self):
+        previous = _snapshot([
+            _collect(
+                sh.ObservationOutcome.SUCCESS,
+                started_at=_T0,
+                finished_at=_T1,
+                collected=1,
+                new=1,
+                empty=False,
+                parse_failures=0,
+                last_publish=_T0,
+            )
+        ], start=_T0, end=_T1, observed=_T1)
+        self.assertEqual(previous.data_delay_seconds, 3600)
+        current = _snapshot(
+            [], start=_T1, end=_T2, observed=_T2, previous=previous
+        )
+        self.assertEqual(current.last_item_publish_time, _T0)
+        self.assertEqual(current.data_delay_seconds, 7200)
 
     def test_verify_completeness_never_updates_collect_last_success(self):
         collect = _collect(

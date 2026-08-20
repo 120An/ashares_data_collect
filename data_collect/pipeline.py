@@ -33,6 +33,10 @@ logger = logging.getLogger(__name__)
 # inject a local shadow sink; pipeline never writes OpenSearch itself.
 _SOURCE_HEALTH_SINK = source_health_shadow.NullShadowSink()
 
+# Step 8 shadow rollout is intentionally limited to the one job that consumes
+# the internal context keys.  Other legacy jobs receive exactly their old kwargs.
+_SOURCE_HEALTH_CONTEXT_JOBS = frozenset({"data_collect.jobs.news_policy"})
+
 
 @dataclass
 class TaskResult:
@@ -296,7 +300,16 @@ def _run_one_task(
             finished_at=None,
         )
         try:
-            message = execute_in_subprocess(job_path, fn_name, timeout=timeout, **call_kwargs)
+            attempt_kwargs = call_kwargs
+            if job_path in _SOURCE_HEALTH_CONTEXT_JOBS:
+                attempt_kwargs = {
+                    **call_kwargs,
+                    source_health_shadow.JOB_RUN_ID_CONTEXT_KEY: job_run_id,
+                    source_health_shadow.ATTEMPT_NO_CONTEXT_KEY: attempt,
+                }
+            message = execute_in_subprocess(
+                job_path, fn_name, timeout=timeout, **attempt_kwargs
+            )
             attempt_finished_at = source_health_shadow.utc_now()
             _observe_task(
                 job_run_id=job_run_id,

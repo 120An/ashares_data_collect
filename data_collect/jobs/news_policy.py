@@ -83,6 +83,30 @@ def _emit_source_observation(**kwargs) -> None:
         )
 
 
+def _source_health_context(
+    job_name: str, kwargs: Dict[str, object]
+) -> tuple[str, int]:
+    """Use pipeline's internal context when valid, otherwise stay direct-call safe."""
+
+    candidate_id = kwargs.get(source_health_shadow.JOB_RUN_ID_CONTEXT_KEY)
+    candidate_attempt = kwargs.get(source_health_shadow.ATTEMPT_NO_CONTEXT_KEY)
+    if candidate_id is None and candidate_attempt is None:
+        started_at = source_health_shadow.utc_now()
+        return source_health_shadow.make_job_run_id(job_name, started_at), 1
+    if (
+        isinstance(candidate_id, str)
+        and candidate_id.strip().startswith("jrun_")
+        and isinstance(candidate_attempt, int)
+        and not isinstance(candidate_attempt, bool)
+        and candidate_attempt >= 1
+    ):
+        return candidate_id.strip(), candidate_attempt
+
+    logger.warning("政策 SourceHealth context 无效，回退 direct-run context")
+    started_at = source_health_shadow.utc_now()
+    return source_health_shadow.make_job_run_id(job_name, started_at), 1
+
+
 # ======== 取数层 ========
 
 # feed 抓取单一实现在适配器层（注册表三期）；别名保留原私有名供测试 monkeypatch
@@ -274,10 +298,7 @@ def run(run_date: str | None = None, **kwargs) -> str:
 
     rss_map = _rss_sources()                  # 每轮加载一次（子进程模型=天然热生效）
     sources = tuple(rss_map) + (_CJZC_SOURCE,)
-    job_started_at = source_health_shadow.utc_now()
-    job_run_id = source_health_shadow.make_job_run_id(
-        "news_policy", job_started_at
-    )
+    job_run_id, attempt_no = _source_health_context("news_policy", kwargs)
     envelopes_by_source: Dict[str, List[dict]] = {}
     successful_timings: Dict[str, tuple[datetime.datetime, datetime.datetime]] = {}
     failed_sources: List[str] = []
@@ -302,7 +323,7 @@ def run(run_date: str | None = None, **kwargs) -> str:
                 observation_type=source_health_shadow.ObservationType.COLLECT,
                 started_at=source_started_at,
                 finished_at=source_finished_at,
-                attempt_no=1,
+                attempt_no=attempt_no,
                 outcome=(
                     source_health_shadow.ObservationOutcome.TIMEOUT
                     if isinstance(exc, TimeoutError)
@@ -318,11 +339,11 @@ def run(run_date: str | None = None, **kwargs) -> str:
         _alert(f"政策源 {','.join(failed_sources)} 本轮采集失败（其余源正常）: "
                f"{'; '.join(errors)[:300]}")
 
-    new_counts: Dict[str, int] = {}
+    archive_new_counts: Dict[str, int] = {}
     for source, envelopes in envelopes_by_source.items():
         started_at, finished_at = successful_timings[source]
         try:
-            new_count = _archive_source(source, envelopes)
+            archive_new_count = _archive_source(source, envelopes)
         except Exception:
             # Collection itself did succeed; archive/new count is simply not
             # evidenced.  Preserve the original archive exception semantics.
@@ -332,7 +353,7 @@ def run(run_date: str | None = None, **kwargs) -> str:
                 observation_type=source_health_shadow.ObservationType.COLLECT,
                 started_at=started_at,
                 finished_at=finished_at,
-                attempt_no=1,
+                attempt_no=attempt_no,
                 outcome=source_health_shadow.ObservationOutcome.SUCCESS,
                 collected_item_count=len(envelopes),
                 new_item_count=None,
@@ -343,22 +364,27 @@ def run(run_date: str | None = None, **kwargs) -> str:
                 ),
             )
             raise
-        new_counts[source] = new_count
+        archive_new_counts[source] = archive_new_count
         _emit_source_observation(
             job_run_id=job_run_id,
             source_id=source,
             observation_type=source_health_shadow.ObservationType.COLLECT,
             started_at=started_at,
             finished_at=finished_at,
-            attempt_no=1,
+            attempt_no=attempt_no,
             outcome=source_health_shadow.ObservationOutcome.SUCCESS,
             collected_item_count=len(envelopes),
-            new_item_count=new_count,
+            # The job archives per source, but OpenSearch create-only writes a
+            # merged batch.  Per-source newly indexed counts are not knowable.
+            new_item_count=None,
             empty_success=len(envelopes) == 0,
             parse_failure_count=0,
             last_item_publish_time=(
                 source_health_shadow.latest_item_publish_time(envelopes)
             ),
+            completeness_info={
+                "archive_new_item_count": archive_new_count,
+            },
         )
 
     all_envelopes = [env for source in sources
@@ -374,7 +400,7 @@ def run(run_date: str | None = None, **kwargs) -> str:
             parts.append(f"{source} 失败")
         else:
             parts.append(f"{source} {len(envelopes_by_source[source])}条"
-                         f"(新{new_counts[source]})")
+                         f"(新{archive_new_counts[source]})")
     summary = f"政策: {' '.join(parts)}, 入库新增 {ok} 重复 {dup}"
     if failed_sources:
         summary += f", 失败源[{','.join(failed_sources)}]"
@@ -393,9 +419,8 @@ def run_verify(start_date: str, end_date: str, **kwargs) -> str:
     dates = _verify_dates(days_back, _today(), include_today=True)
     window = (dates[0], dates[-1])
 
-    job_started_at = source_health_shadow.utc_now()
-    job_run_id = source_health_shadow.make_job_run_id(
-        "news_policy_verify", job_started_at
+    job_run_id, attempt_no = _source_health_context(
+        "news_policy_verify", kwargs
     )
     replayed: List[dict] = []
     for source in _source_names():
@@ -410,7 +435,7 @@ def run_verify(start_date: str, end_date: str, **kwargs) -> str:
                 observation_type=source_health_shadow.ObservationType.VERIFY,
                 started_at=source_started_at,
                 finished_at=source_finished_at,
-                attempt_no=1,
+                attempt_no=attempt_no,
                 outcome=source_health_shadow.ObservationOutcome.SUCCESS,
                 collected_item_count=len(source_replayed),
                 completeness_status=source_health_shadow.CompletenessStatus.UNKNOWN,
@@ -430,7 +455,7 @@ def run_verify(start_date: str, end_date: str, **kwargs) -> str:
                 observation_type=source_health_shadow.ObservationType.VERIFY,
                 started_at=source_started_at,
                 finished_at=source_finished_at,
-                attempt_no=1,
+                attempt_no=attempt_no,
                 outcome=source_health_shadow.ObservationOutcome.FAILURE,
                 error_code=source_health_shadow.classify_error(exc),
                 error_summary=source_health_shadow.error_summary(exc),
