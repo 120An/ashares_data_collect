@@ -134,7 +134,32 @@ def _call_job_fn(job_path: str, fn_name: str, **kwargs):
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    # This deployment-only value is consumed at the subprocess boundary and
+    # never reaches a job's ordinary business kwargs.  A fresh Windows spawn
+    # cannot inherit the parent's module global, so reconstruct the one
+    # explicitly supported source-level sink from its serializable path.
+    shadow_jsonl_path = kwargs.pop(
+        source_health_shadow.SHADOW_JSONL_PATH_CONTEXT_KEY, None
+    )
     module = importlib.import_module(job_path)
+    if job_path in _SOURCE_HEALTH_CONTEXT_JOBS:
+        # Default stays null even if a worker implementation is ever reused.
+        module._SOURCE_HEALTH_SINK = source_health_shadow.NullShadowSink()
+        if shadow_jsonl_path is not None:
+            try:
+                if not isinstance(shadow_jsonl_path, str) or not shadow_jsonl_path.strip():
+                    raise ValueError("shadow JSONL path 必须是非空字符串")
+                module._SOURCE_HEALTH_SINK = source_health_shadow.JsonlShadowSink(
+                    shadow_jsonl_path
+                )
+            except Exception as exc:  # noqa: BLE001 - monitoring stays fail-open
+                logger.warning(
+                    "SourceHealth 子进程 sink 恢复失败（已 fail-open）: %r", exc
+                )
+    elif shadow_jsonl_path is not None:
+        logger.warning(
+            "忽略不支持 job 的 SourceHealth shadow context: %s", job_path
+        )
     fn = getattr(module, fn_name, None)
     if fn is None:
         raise AttributeError(f"模块 {job_path} 未实现 {fn_name}() 函数")
@@ -300,13 +325,23 @@ def _run_one_task(
             finished_at=None,
         )
         try:
-            attempt_kwargs = call_kwargs
+            # Always copy/scrub the deployment-only key so user/business kwargs
+            # cannot accidentally activate or leak shadow configuration.
+            attempt_kwargs = {
+                key: value for key, value in call_kwargs.items()
+                if key != source_health_shadow.SHADOW_JSONL_PATH_CONTEXT_KEY
+            }
             if job_path in _SOURCE_HEALTH_CONTEXT_JOBS:
-                attempt_kwargs = {
-                    **call_kwargs,
+                attempt_kwargs.update({
                     source_health_shadow.JOB_RUN_ID_CONTEXT_KEY: job_run_id,
                     source_health_shadow.ATTEMPT_NO_CONTEXT_KEY: attempt,
-                }
+                })
+                if isinstance(
+                    _SOURCE_HEALTH_SINK, source_health_shadow.JsonlShadowSink
+                ):
+                    attempt_kwargs[
+                        source_health_shadow.SHADOW_JSONL_PATH_CONTEXT_KEY
+                    ] = str(_SOURCE_HEALTH_SINK.path.resolve())
             message = execute_in_subprocess(
                 job_path, fn_name, timeout=timeout, **attempt_kwargs
             )

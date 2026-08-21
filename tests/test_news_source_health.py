@@ -72,6 +72,12 @@ def _snapshot(
 
 
 class SourceObservationTests(unittest.TestCase):
+    def test_shadow_jsonl_path_context_key_is_stable_and_internal(self):
+        self.assertEqual(
+            sh.SHADOW_JSONL_PATH_CONTEXT_KEY,
+            "_source_health_shadow_jsonl_path",
+        )
+
     def test_observation_times_must_be_timezone_aware(self):
         with self.assertRaisesRegex(ValueError, "时区"):
             sh.SourceObservation(

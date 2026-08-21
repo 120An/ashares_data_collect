@@ -26,6 +26,7 @@ from data_collect.news_model.contracts import (
 SHADOW_HEALTH_POLICY_VERSION = "source_health_shadow_v1"
 JOB_RUN_ID_CONTEXT_KEY = "_source_health_job_run_id"
 ATTEMPT_NO_CONTEXT_KEY = "_source_health_attempt_no"
+SHADOW_JSONL_PATH_CONTEXT_KEY = "_source_health_shadow_jsonl_path"
 _BEIJING = timezone(timedelta(hours=8), "Asia/Shanghai")
 _SUMMARY_LIMIT = 500
 
@@ -573,6 +574,7 @@ __all__ = [
     "ObservationOutcome",
     "ObservationType",
     "SHADOW_HEALTH_POLICY_VERSION",
+    "SHADOW_JSONL_PATH_CONTEXT_KEY",
     "SourceObservation",
     "build_source_health",
     "classify_error",

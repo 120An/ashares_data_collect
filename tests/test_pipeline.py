@@ -1,5 +1,8 @@
 """pipeline.py 测试（不依赖 xtquant 或数据库）。"""
 
+import datetime
+import json
+
 import pytest
 
 from data_collect import pipeline as pipeline_module
@@ -158,7 +161,10 @@ def test_pipeline_retry_count_and_notify_count_are_unchanged(monkeypatch):
     result = pipeline_module._run_one_task(
         {"name": "retry_task", "job": "fake.job", "retries": 2},
         None,
-        {},
+        {
+            source_health_shadow.SHADOW_JSONL_PATH_CONTEXT_KEY:
+                "must-not-reach-legacy-job.jsonl",
+        },
     )
 
     assert result.success is True and result.message == "ok"
@@ -166,6 +172,7 @@ def test_pipeline_retry_count_and_notify_count_are_unchanged(monkeypatch):
     assert all(
         source_health_shadow.JOB_RUN_ID_CONTEXT_KEY not in kwargs
         and source_health_shadow.ATTEMPT_NO_CONTEXT_KEY not in kwargs
+        and source_health_shadow.SHADOW_JSONL_PATH_CONTEXT_KEY not in kwargs
         for kwargs in calls
     )                                             # 非 news_policy kwargs 不变
     assert len(alerts) == 2                       # original pre-retry alerts only
@@ -251,6 +258,157 @@ def test_news_policy_verify_receives_same_internal_context(monkeypatch):
         "jrun_"
     )
     assert captured[0][source_health_shadow.ATTEMPT_NO_CONTEXT_KEY] == 1
+    assert source_health_shadow.SHADOW_JSONL_PATH_CONTEXT_KEY not in captured[0]
+
+
+def test_default_null_sink_does_not_propagate_jsonl_or_create_file(
+        tmp_path, monkeypatch):
+    captured = []
+    shadow_path = tmp_path / "must-not-exist.jsonl"
+    monkeypatch.setattr(
+        pipeline_module, "_SOURCE_HEALTH_SINK",
+        source_health_shadow.NullShadowSink(),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "execute_in_subprocess",
+        lambda *args, **kwargs: captured.append(dict(kwargs)) or "ok",
+    )
+
+    result = pipeline_module._run_one_task(
+        {"name": "news_policy", "job": "data_collect.jobs.news_policy"},
+        None,
+        {},
+    )
+
+    assert result.success is True
+    assert source_health_shadow.SHADOW_JSONL_PATH_CONTEXT_KEY not in captured[0]
+    assert not shadow_path.exists()
+
+
+def test_news_policy_jsonl_path_is_stable_across_retry(monkeypatch, tmp_path):
+    path = tmp_path / "retry-shadow.jsonl"
+    calls = []
+
+    def flaky(*args, **kwargs):
+        calls.append(dict(kwargs))
+        if len(calls) == 1:
+            raise RuntimeError("retry once")
+        return "ok"
+
+    monkeypatch.setattr(
+        pipeline_module, "_SOURCE_HEALTH_SINK",
+        source_health_shadow.JsonlShadowSink(path),
+    )
+    monkeypatch.setattr(pipeline_module, "execute_in_subprocess", flaky)
+    monkeypatch.setattr(pipeline_module, "send_dingtalk", lambda message: None)
+
+    result = pipeline_module._run_one_task(
+        {
+            "name": "news_policy",
+            "job": "data_collect.jobs.news_policy",
+            "retries": 1,
+        },
+        None,
+        {},
+    )
+
+    assert result.success is True
+    assert [
+        item[source_health_shadow.SHADOW_JSONL_PATH_CONTEXT_KEY]
+        for item in calls
+    ] == [str(path.resolve()), str(path.resolve())]
+    assert len({
+        item[source_health_shadow.JOB_RUN_ID_CONTEXT_KEY] for item in calls
+    }) == 1
+    assert [
+        item[source_health_shadow.ATTEMPT_NO_CONTEXT_KEY] for item in calls
+    ] == [1, 2]
+
+
+def test_jsonl_path_crosses_real_subprocess_for_news_policy_verify(
+        tmp_path, monkeypatch):
+    """真实 ProcessPool/spawn：父 task 与子 source 写入同一个 JSONL。"""
+    archive = tmp_path / "archive"
+    spool = tmp_path / "spool"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "news:\n"
+        f"  archive_base: '{archive.as_posix()}'\n"
+        f"  archive_base_posix: '{archive.as_posix()}'\n"
+        f"  spool_dir: '{spool.as_posix()}'\n"
+        "  verify_days_back: 1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DATA_COLLECT_CONFIG", str(config_path))
+    shadow_path = tmp_path / "gray" / "observations.jsonl"
+    monkeypatch.setattr(
+        pipeline_module, "_SOURCE_HEALTH_SINK",
+        source_health_shadow.JsonlShadowSink(shadow_path),
+    )
+
+    result = pipeline_module._run_one_task(
+        {
+            "name": "news_policy_verify",
+            "job": "data_collect.jobs.news_policy",
+            "fn": "run_verify",
+            "days_back": 1,
+            "timeout": 20,
+        },
+        None,
+        {},
+    )
+
+    assert result.success is True
+    records = [
+        json.loads(line) for line in shadow_path.read_text(encoding="utf-8").splitlines()
+    ]
+    task_records = [item for item in records if item["observation_type"] == "task"]
+    source_records = [
+        item for item in records if item["observation_type"] == "verify"
+    ]
+    assert [item["outcome"] for item in task_records] == ["started", "success"]
+    assert {item["source_id"] for item in source_records} == {
+        "govcn_policy", "govcn_gwy", "em_cjzc"
+    }
+    assert len(source_records) == 3
+    assert len({item["job_run_id"] for item in records}) == 1
+    assert {item["attempt_no"] for item in records} == {1}
+
+
+def test_news_policy_restored_jsonl_write_failure_is_fail_open(
+        tmp_path, monkeypatch):
+    from data_collect.jobs import news_policy
+
+    monkeypatch.setattr(news_policy, "get_news_config",
+                        lambda: {"verify_days_back": 1})
+    monkeypatch.setattr(news_policy, "_today",
+                        lambda: datetime.date(2026, 8, 21))
+    monkeypatch.setattr(news_policy, "_policy_sources", lambda: {})
+    monkeypatch.setattr(news_policy.news_archive, "replay",
+                        lambda source, window: iter(()))
+    monkeypatch.setattr(
+        news_policy, "_SOURCE_HEALTH_SINK",
+        source_health_shadow.NullShadowSink(),
+    )
+    run_id = source_health_shadow.make_job_run_id(
+        "news_policy_verify", source_health_shadow.utc_now()
+    )
+
+    result = pipeline_module._call_job_fn(
+        "data_collect.jobs.news_policy",
+        "run_verify",
+        start_date="20260820",
+        end_date="20260821",
+        **{
+            source_health_shadow.JOB_RUN_ID_CONTEXT_KEY: run_id,
+            source_health_shadow.ATTEMPT_NO_CONTEXT_KEY: 1,
+            # Opening a directory as a JSONL file fails; collection must not.
+            source_health_shadow.SHADOW_JSONL_PATH_CONTEXT_KEY: str(tmp_path),
+        },
+    )
+
+    assert result.startswith("政策 verify(")
 
 
 def test_pipeline_timeout_is_task_level_unknown_and_incomplete(monkeypatch):
