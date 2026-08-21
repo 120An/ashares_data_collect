@@ -69,6 +69,88 @@ def _legacy_news_body(analyzer: str = "smartcn") -> dict:
 
 
 class NewsYearMappingTests(unittest.TestCase):
+    def _assert_mapping_pair_compatible(self, existing_field, target_field):
+        existing = {"mappings": {"properties": {"when": existing_field}}}
+        target = {"mappings": {"properties": {"when": target_field}}}
+        diff = schema.require_additive_mapping(existing, target)
+        self.assertTrue(diff.is_additive_compatible)
+        self.assertEqual(diff.additive_changes, ())
+        self.assertEqual(diff.incompatible_changes, ())
+
+    def test_date_implicit_default_matches_explicit_default(self):
+        self._assert_mapping_pair_compatible(
+            {"type": "date"},
+            {"type": "date", "format": schema.CANONICAL_DATE_FORMAT},
+        )
+
+    def test_date_explicit_default_matches_implicit_default(self):
+        self._assert_mapping_pair_compatible(
+            {"type": "date", "format": schema.CANONICAL_DATE_FORMAT},
+            {"type": "date"},
+        )
+
+    def test_date_implicit_default_matches_implicit_default(self):
+        self._assert_mapping_pair_compatible(
+            {"type": "date"},
+            {"type": "date"},
+        )
+
+    def test_date_implicit_default_rejects_explicit_custom_format(self):
+        existing = {"mappings": {"properties": {"when": {"type": "date"}}}}
+        target = {
+            "mappings": {
+                "properties": {
+                    "when": {"type": "date", "format": "yyyy-MM-dd"}
+                }
+            }
+        }
+        with self.assertRaisesRegex(
+            schema.MappingCompatibilityError,
+            "existing mapping parameter would change",
+        ):
+            schema.require_additive_mapping(existing, target)
+
+    def test_date_explicit_custom_rejects_implicit_default(self):
+        existing = {
+            "mappings": {
+                "properties": {
+                    "when": {"type": "date", "format": "yyyy-MM-dd"}
+                }
+            }
+        }
+        target = {"mappings": {"properties": {"when": {"type": "date"}}}}
+        with self.assertRaisesRegex(
+            schema.MappingCompatibilityError,
+            "existing mapping parameter would change",
+        ):
+            schema.require_additive_mapping(existing, target)
+
+    def test_date_and_date_nanos_remain_incompatible(self):
+        existing = {"mappings": {"properties": {"when": {"type": "date"}}}}
+        target = {
+            "mappings": {"properties": {"when": {"type": "date_nanos"}}}
+        }
+        with self.assertRaisesRegex(
+            schema.MappingCompatibilityError, "field type differs"
+        ):
+            schema.require_additive_mapping(existing, target)
+
+    def test_live_shape_phase1_dates_do_not_create_false_conflicts(self):
+        existing = _legacy_news_body()
+        properties = existing["mappings"]["properties"]
+        for field_name, definition in schema.PHASE1_NEWS_ADDITIVE_PROPERTIES.items():
+            properties[field_name] = deepcopy(definition)
+        for field_name in (
+            "publish_time", "collect_time", "created_at", "updated_at"
+        ):
+            properties[field_name] = {"type": "date"}
+
+        diff = schema.news_year_additive_diff(existing)
+
+        self.assertTrue(diff.is_additive_compatible)
+        self.assertEqual(diff.additive_changes, ())
+        self.assertEqual(diff.incompatible_changes, ())
+
     def test_phase1_fields_are_additive_and_explicit(self):
         existing = _legacy_news_body()
         diff = schema.news_year_additive_diff(existing)

@@ -274,6 +274,24 @@ def _settings_section(body: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return settings
 
 
+def _field_mapping_with_effective_defaults(
+    definition: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Normalize only OpenSearch defaults that are semantically explicit.
+
+    OpenSearch treats a ``date`` field without ``format`` as if it declared
+    ``strict_date_optional_time||epoch_millis``.  Mapping responses omit that
+    default, so comparison must materialize it on both sides.  No other field
+    type or mapping parameter is relaxed here.
+    """
+
+    if definition.get("type") != "date" or "format" in definition:
+        return definition
+    normalized = dict(definition)
+    normalized["format"] = CANONICAL_DATE_FORMAT
+    return normalized
+
+
 def _compare_dict(
     existing: Mapping[str, Any],
     target: Mapping[str, Any],
@@ -283,6 +301,10 @@ def _compare_dict(
     *,
     field_definition: bool,
 ) -> None:
+    if field_definition:
+        existing = _field_mapping_with_effective_defaults(existing)
+        target = _field_mapping_with_effective_defaults(target)
+
     for key, target_value in target.items():
         child_path = f"{path}.{key}" if path else key
         if key not in existing:
